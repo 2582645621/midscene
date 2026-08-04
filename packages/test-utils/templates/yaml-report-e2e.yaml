@@ -1,0 +1,38 @@
+# Template: Report App E2E Test (YAML)
+#
+# Copy this file to apps/report/e2e/ and customize.
+# Run with: pnpm run e2e (from apps/report/)
+#
+# This template follows the pattern used by existing report e2e tests.
+# Important: Keep assertions on aiAssert for AI coverage dogfooding.
+
+target:
+  serve: ./dist
+  url: demo.html
+
+tasks:
+  - name: report loads with expected structure
+    flow:
+      - sleep: 5000
+      - aiAssert: The report page is loaded with visible content sections
+
+  - name: UI element is interactive
+    flow:
+      - aiTap: the interactive element description
+      - sleep: 500
+      - aiAssert: The expected result of the interaction is visible
+
+  - name: visual state verification
+    flow:
+      - aiHover:
+          locate:
+            prompt: the element to hover over
+            deepLocate: true
+      - sleep: 300
+      - aiAssert: The hover state or tooltip is visible
+
+  # - name: navigation flow
+  #   flow:
+  #     - aiTap: a navigation item in the sidebar
+  #     - sleep: 1000
+  #     - aiAssert: The navigation target content is now displayed

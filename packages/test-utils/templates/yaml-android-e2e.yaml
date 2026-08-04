@@ -1,0 +1,34 @@
+# Template: Android E2E Test (YAML)
+#
+# Copy this file and customize for your Android automation scenario.
+# Run with: npx midscene ./path/to/this-file.yaml
+#
+# Requires: adb server running with a connected device/emulator.
+
+android:
+  deviceId: "${ANDROID_DEVICE_ID}"
+  # launch: com.example.app/.MainActivity
+
+# agent:
+#   aiActContext: "This is an Android application for ..."
+
+tasks:
+  - name: app launches successfully
+    flow:
+      - sleep: 3000
+      - aiAssert: The app main screen is displayed
+
+  - name: navigate and interact
+    flow:
+      - aiTap: the menu button
+      - sleep: 500
+      - aiTap: the settings option in the menu
+      - aiAssert: The settings screen is displayed
+
+  # - name: input text
+  #   flow:
+  #     - aiTap: the search input field
+  #     - aiInput: "search query"
+  #       locate: the search input
+  #     - aiTap: the search button
+  #     - aiAssert: Search results are displayed

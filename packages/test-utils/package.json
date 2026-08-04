@@ -1,0 +1,29 @@
+{
+  "name": "@midscene/test-utils",
+  "version": "1.9.8",
+  "private": true,
+  "description": "Shared test utilities for Midscene monorepo: mock factories, fixture helpers, YAML builders, and test templates",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./mock-agent": "./src/mock-agent.ts",
+    "./yaml-builder": "./src/yaml-builder.ts",
+    "./playwright-presets": "./src/playwright-presets.ts",
+    "./fixtures": "./src/fixtures.ts"
+  },
+  "scripts": {
+    "test": "vitest --run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@midscene/core": "workspace:*",
+    "@midscene/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "typescript": "^5.8.3",
+    "vitest": "3.0.5"
+  },
+  "license": "MIT"
+}

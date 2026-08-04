@@ -1,0 +1,475 @@
+import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { pixelBboxToRect } from '@/ai-model/workflows/inspect/locate-result-rect';
+import type { TMultimodalPrompt, TUserPrompt } from '@/common';
+import type { AbstractInterface } from '@/device';
+import { ScreenshotItem } from '@/screenshot-item';
+import type {
+  ElementCacheFeature,
+  LocateResultElement,
+  PixelBbox,
+  PlanningLocateParam,
+  PlanningLocateParamWithLocatedPixelBbox,
+  Rect,
+  ScrollParam,
+  Size,
+  UIContext,
+} from '@/types';
+import { uploadTestInfoToServer } from '@/utils';
+import {
+  MIDSCENE_REPORT_QUIET,
+  MIDSCENE_REPORT_TAG_NAME,
+  globalConfigManager,
+} from '@midscene/shared/env';
+import { generateElementByRect } from '@midscene/shared/extractor';
+import {
+  createImgBase64ByFormat,
+  imageInfoOfBase64,
+  resizeImgBase64,
+} from '@midscene/shared/img';
+import { getDebug } from '@midscene/shared/logger';
+import { _keyDefinitions } from '@midscene/shared/us-keyboard-layout';
+import { assert, ifInBrowser, logMsg, uuid } from '@midscene/shared/utils';
+import dayjs from 'dayjs';
+import type { TaskCache } from './task-cache';
+import { debug as cacheDebug } from './task-cache';
+
+const agentDebug = getDebug('agent');
+const screenshotDataUrlPattern = /^data:image\/[a-zA-Z0-9.+-]+;base64,/i;
+
+const inferBase64ImageFormat = (base64Body: string) => {
+  if (base64Body.startsWith('iVBORw0KGgo')) {
+    return 'png';
+  }
+  return 'jpeg';
+};
+
+const normalizeScreenshotBase64 = (screenshotBase64: string) => {
+  const trimmedBase64 = screenshotBase64.trim();
+  if (screenshotDataUrlPattern.test(trimmedBase64)) {
+    return trimmedBase64;
+  }
+
+  const base64Body = trimmedBase64.replace(/\s/g, '');
+  assert(base64Body, 'screenshotBase64 must include image data');
+  return createImgBase64ByFormat(
+    inferBase64ImageFormat(base64Body),
+    base64Body,
+  );
+};
+
+const legacyScrollTypeMap = {
+  once: 'singleAction',
+  untilBottom: 'scrollToBottom',
+  untilTop: 'scrollToTop',
+  untilRight: 'scrollToRight',
+  untilLeft: 'scrollToLeft',
+} as const;
+
+export const normalizeScrollType = (
+  scrollType: string | undefined,
+): ScrollParam['scrollType'] | undefined => {
+  if (!scrollType) {
+    return undefined;
+  }
+
+  if (scrollType in legacyScrollTypeMap) {
+    return legacyScrollTypeMap[scrollType as keyof typeof legacyScrollTypeMap];
+  }
+
+  return scrollType as ScrollParam['scrollType'];
+};
+
+export async function commonContextParser(
+  interfaceInstance: AbstractInterface,
+  _opt: {
+    uploadServerUrl?: string;
+    screenshotShrinkFactor?: number;
+  },
+): Promise<UIContext> {
+  const debug = getDebug('commonContextParser');
+
+  assert(interfaceInstance, 'interfaceInstance is required');
+
+  debug('Getting interface description');
+  const description = interfaceInstance.describe?.() || '';
+  debug('Interface description end');
+
+  debug('Uploading test info to server');
+  uploadTestInfoToServer({
+    testUrl: description,
+    serverUrl: _opt.uploadServerUrl,
+  });
+  debug('UploadTestInfoToServer end');
+
+  debug('will get size');
+  const interfaceSize = await interfaceInstance.size();
+  const { width: logicalWidth, height: logicalHeight } = interfaceSize;
+
+  if ((interfaceSize as unknown as { dpr: number }).dpr) {
+    console.warn(
+      'Warning: return value of interface.size() include a dpr property, which is not expected and ignored. ',
+    );
+  }
+
+  if (!Number.isFinite(logicalWidth) || !Number.isFinite(logicalHeight)) {
+    throw new Error(
+      `Invalid interface size: width and height must be finite numbers. Received width: ${logicalWidth}, height: ${logicalHeight}`,
+    );
+  }
+
+  if (logicalWidth <= 0 || logicalHeight <= 0) {
+    throw new Error(
+      `Invalid interface size: width and height must be positive numbers. Received width: ${logicalWidth}, height: ${logicalHeight}`,
+    );
+  }
+
+  debug(`size: ${logicalWidth}x${logicalHeight}`);
+
+  const screenshotBase64 = await interfaceInstance.screenshotBase64();
+  const screenshotCapturedAt = Date.now();
+  assert(screenshotBase64!, 'screenshotBase64 is required');
+
+  // Get physical screenshot dimensions
+  debug('will get screenshot dimensions');
+  const { width: imgWidth, height: imgHeight } =
+    await imageInfoOfBase64(screenshotBase64);
+
+  if (!Number.isFinite(imgWidth) || !Number.isFinite(imgHeight)) {
+    throw new Error(
+      `Invalid screenshot dimensions: width and height must be finite numbers. Received width: ${imgWidth}, height: ${imgHeight}`,
+    );
+  }
+  if (imgWidth <= 0 || imgHeight <= 0) {
+    throw new Error(
+      `Invalid screenshot dimensions: width and height must be positive numbers. Received width: ${imgWidth}, height: ${imgHeight}`,
+    );
+  }
+  debug('screenshot dimensions', imgWidth, 'x', imgHeight);
+
+  // Detect orientation mismatch between logical size and screenshot.
+  // Some devices (e.g. OPPO) report wrong orientation via ADB, causing
+  // size() to return portrait dimensions even when the device is landscape.
+  // We detect this by comparing aspect ratios and swap if they disagree.
+  const logicalIsPortrait = logicalWidth < logicalHeight;
+  const screenshotIsPortrait = imgWidth < imgHeight;
+  let finalLogicalWidth = logicalWidth;
+  let finalLogicalHeight = logicalHeight;
+  if (logicalIsPortrait !== screenshotIsPortrait) {
+    debug(
+      `Orientation mismatch detected: logical size ${logicalWidth}x${logicalHeight} (${logicalIsPortrait ? 'portrait' : 'landscape'}) vs screenshot ${imgWidth}x${imgHeight} (${screenshotIsPortrait ? 'portrait' : 'landscape'}). Swapping logical dimensions.`,
+    );
+    finalLogicalWidth = logicalHeight;
+    finalLogicalHeight = logicalWidth;
+  }
+
+  const userShrinkFactor = _opt.screenshotShrinkFactor ?? 1;
+
+  if (!Number.isFinite(userShrinkFactor) || userShrinkFactor < 1) {
+    throw new Error(
+      `Invalid screenshotShrinkFactor: must be a finite number >= 1. Received: ${userShrinkFactor}`,
+    );
+  }
+
+  const dpr = imgWidth / finalLogicalWidth;
+
+  debug('calculated dpr:', dpr);
+
+  const shrunkShotToLogicalRatio = dpr / userShrinkFactor;
+
+  debug('shrunkShotToLogicalRatio', shrunkShotToLogicalRatio);
+
+  if (userShrinkFactor !== 1) {
+    const targetWidth = Math.round(imgWidth / userShrinkFactor);
+    const targetHeight = Math.round(imgHeight / userShrinkFactor);
+
+    debug(
+      `Applying screenshot shrink factor: ${userShrinkFactor} (physical: ${imgWidth}x${imgHeight} -> target: ${targetWidth}x${targetHeight})`,
+    );
+
+    const resizedBase64 = await resizeImgBase64(screenshotBase64, {
+      width: targetWidth,
+      height: targetHeight,
+    });
+    return {
+      shotSize: {
+        width: targetWidth,
+        height: targetHeight,
+      },
+      deprecatedDpr: dpr,
+      screenshot: ScreenshotItem.create(resizedBase64, screenshotCapturedAt),
+      shrunkShotToLogicalRatio,
+    };
+  }
+
+  return {
+    shotSize: {
+      width: imgWidth,
+      height: imgHeight,
+    },
+    deprecatedDpr: dpr,
+    screenshot: ScreenshotItem.create(screenshotBase64, screenshotCapturedAt),
+    shrunkShotToLogicalRatio,
+  };
+}
+
+export async function createScreenshotBoundUIContext(
+  screenshotBase64: string,
+  opt: {
+    screenshotSize?: Size;
+  },
+): Promise<UIContext> {
+  const normalizedScreenshotBase64 =
+    normalizeScreenshotBase64(screenshotBase64);
+  const actualScreenshotSize = await imageInfoOfBase64(
+    normalizedScreenshotBase64,
+  );
+  if (
+    opt.screenshotSize &&
+    (opt.screenshotSize.width !== actualScreenshotSize.width ||
+      opt.screenshotSize.height !== actualScreenshotSize.height)
+  ) {
+    agentDebug(
+      'describeElementAtPoint screenshotSize mismatch, use actual size',
+      {
+        provided: opt.screenshotSize,
+        actual: actualScreenshotSize,
+      },
+    );
+  }
+
+  return {
+    screenshot: ScreenshotItem.create(normalizedScreenshotBase64, Date.now()),
+    shotSize: actualScreenshotSize,
+    shrunkShotToLogicalRatio: 1,
+    _isFrozen: true,
+  };
+}
+
+export function getReportFileName(tag = 'web') {
+  const reportTagName = globalConfigManager.getEnvConfigValue(
+    MIDSCENE_REPORT_TAG_NAME,
+  );
+  const dateTimeInFileName = dayjs().format('YYYY-MM-DD_HH-mm-ss');
+  // ensure uniqueness at the same time
+  const uniqueId = uuid().substring(0, 8);
+  return `${reportTagName || tag}-${dateTimeInFileName}-${uniqueId}`;
+}
+
+export function printReportMsg(filepath: string) {
+  if (globalConfigManager.getEnvConfigInBoolean(MIDSCENE_REPORT_QUIET)) {
+    return;
+  }
+  logMsg(`Midscene - report file updated: ${filepath}`);
+}
+
+type NormalizeFilePathsOptions = {
+  fileExists?: (path: string) => boolean;
+  isInBrowser?: boolean;
+  resolvePath?: (path: string) => string;
+  wslDistroName?: string;
+  cwd?: string;
+};
+
+export function normalizeFilePaths(
+  files: string[],
+  options: NormalizeFilePathsOptions = {},
+): string[] {
+  const {
+    fileExists = existsSync,
+    isInBrowser = ifInBrowser,
+    resolvePath = resolve,
+    wslDistroName = process.env.WSL_DISTRO_NAME,
+    cwd = process.cwd(),
+  } = options;
+
+  if (isInBrowser) {
+    throw new Error('File chooser is not supported in browser environment');
+  }
+
+  return files.map((file) => {
+    const absolutePath = resolvePath(file);
+    if (!fileExists(absolutePath)) {
+      throw new Error(
+        `File not found: ${file}. Resolved to: ${absolutePath}. Current working directory: ${cwd}`,
+      );
+    }
+
+    if (!wslDistroName) {
+      return absolutePath;
+    }
+
+    const wslMount = absolutePath.match(/^\/mnt\/([a-z])\//);
+    if (wslMount) {
+      return `${wslMount[1].toUpperCase()}:\\${absolutePath.slice(7).replace(/\//g, '\\')}`;
+    }
+
+    return `\\\\wsl$\\${wslDistroName}${absolutePath.replace(/\//g, '\\')}`;
+  });
+}
+
+export function isPixelBbox(value: unknown): value is PixelBbox {
+  return (
+    Array.isArray(value) &&
+    value.length === 4 &&
+    value.every((item) => typeof item === 'number' && Number.isFinite(item))
+  );
+}
+
+type PlanningLocateParamWithMaybeLocatedPixelBbox = PlanningLocateParam & {
+  locatedPixelBbox?: unknown;
+};
+
+export function ifPlanLocateParamHasLocatedPixelBbox(
+  planLocateParam: PlanningLocateParamWithMaybeLocatedPixelBbox,
+): planLocateParam is PlanningLocateParamWithLocatedPixelBbox {
+  return isPixelBbox(planLocateParam.locatedPixelBbox);
+}
+
+export function matchElementFromPlan(
+  planLocateParam: PlanningLocateParamWithLocatedPixelBbox,
+): LocateResultElement | undefined {
+  if (!planLocateParam) {
+    return undefined;
+  }
+
+  const rect = pixelBboxToRect(planLocateParam.locatedPixelBbox);
+
+  const element = generateElementByRect(
+    rect,
+    typeof planLocateParam.prompt === 'string'
+      ? planLocateParam.prompt
+      : planLocateParam.prompt?.prompt || '',
+  );
+  return element;
+}
+
+export async function matchElementFromCache(
+  context: {
+    taskCache?: TaskCache;
+    interfaceInstance: AbstractInterface;
+  },
+  cacheEntry: ElementCacheFeature | undefined,
+  cachePrompt: TUserPrompt,
+  cacheable: boolean | undefined,
+): Promise<LocateResultElement | undefined> {
+  if (!cacheEntry) {
+    return undefined;
+  }
+
+  if (cacheable === false) {
+    cacheDebug('cache disabled for prompt: %s', cachePrompt);
+    return undefined;
+  }
+
+  if (!context.taskCache?.isCacheResultUsed) {
+    return undefined;
+  }
+
+  if (!context.interfaceInstance.rectMatchesCacheFeature) {
+    cacheDebug(
+      'interface does not implement rectMatchesCacheFeature, skip cache',
+    );
+    return undefined;
+  }
+
+  try {
+    const rect =
+      await context.interfaceInstance.rectMatchesCacheFeature(cacheEntry);
+    const element: LocateResultElement = {
+      center: [
+        Math.round(rect.left + rect.width / 2),
+        Math.round(rect.top + rect.height / 2),
+      ],
+      rect,
+      description:
+        typeof cachePrompt === 'string'
+          ? cachePrompt
+          : cachePrompt.prompt || '',
+    };
+
+    cacheDebug('cache hit, prompt: %s', cachePrompt);
+    return element;
+  } catch (error) {
+    cacheDebug('rectMatchesCacheFeature error: %s', error);
+    return undefined;
+  }
+}
+
+declare const __VERSION__: string | undefined;
+
+export const getMidsceneVersion = (): string => {
+  if (typeof __VERSION__ !== 'undefined') {
+    return __VERSION__;
+  } else if (
+    process.env.__VERSION__ &&
+    process.env.__VERSION__ !== 'undefined'
+  ) {
+    return process.env.__VERSION__;
+  }
+  throw new Error('__VERSION__ inject failed during build');
+};
+
+export const parsePrompt = (
+  prompt: TUserPrompt,
+): {
+  textPrompt: string;
+  multimodalPrompt?: TMultimodalPrompt;
+} => {
+  if (typeof prompt === 'string') {
+    return {
+      textPrompt: prompt,
+      multimodalPrompt: undefined,
+    };
+  }
+  return {
+    textPrompt: prompt.prompt,
+    multimodalPrompt: prompt.images
+      ? {
+          images: prompt.images,
+          convertHttpImage2Base64: !!prompt.convertHttpImage2Base64,
+        }
+      : undefined,
+  };
+};
+
+export const transformLogicalElementToScreenshot = (
+  element: LocateResultElement,
+  shrunkShotToLogicalRatio: number,
+): LocateResultElement => {
+  if (shrunkShotToLogicalRatio === 1) {
+    return element;
+  }
+
+  return {
+    ...element,
+    center: [
+      Math.round(element.center[0] * shrunkShotToLogicalRatio),
+      Math.round(element.center[1] * shrunkShotToLogicalRatio),
+    ],
+    rect: {
+      ...element.rect,
+      left: Math.round(element.rect.left * shrunkShotToLogicalRatio),
+      top: Math.round(element.rect.top * shrunkShotToLogicalRatio),
+      width: Math.round(element.rect.width * shrunkShotToLogicalRatio),
+      height: Math.round(element.rect.height * shrunkShotToLogicalRatio),
+    },
+  };
+};
+
+export const transformLogicalRectToScreenshotRect = (
+  rect: Rect,
+  shrunkShotToLogicalRatio: number,
+): Rect => {
+  if (shrunkShotToLogicalRatio === 1) {
+    return rect;
+  }
+
+  return {
+    ...rect,
+    left: Math.round(rect.left * shrunkShotToLogicalRatio),
+    top: Math.round(rect.top * shrunkShotToLogicalRatio),
+    width: Math.round(rect.width * shrunkShotToLogicalRatio),
+    height: Math.round(rect.height * shrunkShotToLogicalRatio),
+  };
+};

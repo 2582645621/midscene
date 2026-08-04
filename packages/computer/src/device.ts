@@ -1,0 +1,1401 @@
+import { execFileSync, execSync, spawnSync } from 'node:child_process';
+import { chmodSync, existsSync, statSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import type {
+  DeviceAction,
+  InterfaceType,
+  LocateResultElement,
+  Size,
+} from '@midscene/core';
+import {
+  type AbstractInterface,
+  type ComputerInputPrimitives,
+  defineAction,
+  defineActionsFromInputPrimitives,
+} from '@midscene/core/device';
+import { sleep } from '@midscene/core/utils';
+import { createImgBase64ByFormat } from '@midscene/shared/img';
+import { getDebug } from '@midscene/shared/logger';
+import screenshot from 'screenshot-desktop';
+import {
+  ComputerInputDriver,
+  type LibNut,
+  type ScrollDirection,
+} from './input-driver';
+import type { XvfbInstance } from './xvfb';
+import { checkXvfbInstalled, needsXvfb, startXvfb } from './xvfb';
+
+declare const __VERSION__: string;
+
+interface ScreenshotOptions {
+  format: 'png' | 'jpg';
+  screen?: string | number;
+}
+
+interface ScreenshotDisplay {
+  id: string | number;
+  name?: string;
+  primary?: boolean;
+}
+
+interface NativeDisplayInfoResponse {
+  displays?: DarwinDisplayGeometry[];
+}
+
+interface DarwinFrontmostApplication {
+  pid: number;
+  name: string;
+}
+
+export interface DarwinDisplayGeometry {
+  screenIndex: number;
+  cgDisplayId: number;
+  primary: boolean;
+  bounds: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
+}
+
+export interface Point {
+  x: number;
+  y: number;
+}
+
+// Constants
+const SMOOTH_MOVE_STEPS_TAP = 8;
+const SMOOTH_MOVE_STEPS_MOUSE_MOVE = 10;
+const SMOOTH_MOVE_DELAY_TAP = 8;
+const SMOOTH_MOVE_DELAY_MOUSE_MOVE = 10;
+const MOUSE_MOVE_EFFECT_WAIT = 300;
+const CLICK_SETTLE_DELAY = 50;
+const CLICK_HOLD_DURATION = 100;
+const CLICK_FOCUS_SETTLE_DELAY = 120;
+const INPUT_FOCUS_DELAY = 300;
+const INPUT_CLEAR_DELAY = 150;
+const SCROLL_REPEAT_COUNT = 10;
+const SCROLL_STEP_DELAY = 100;
+const SCROLL_COMPLETE_DELAY = 500;
+// Edge scrolls (scrollToTop / scrollToBottom / ...) use a large total
+// distance so ordinary pages clamp at the boundary. The step count controls
+// smoothness; 400 steps at ~16ms each is ~6.4s in the worst case but WebKit
+// short-circuits the remaining events once the boundary is reached.
+const EDGE_SCROLL_TOTAL_PX = 50_000;
+const EDGE_SCROLL_STEPS = 400;
+// singleAction vertical/horizontal scroll: target ~30px per step and a
+// minimum of 10 steps so small distances still feel momentum-like.
+const PHASED_PIXELS_PER_STEP = 30;
+const PHASED_MIN_STEPS = 10;
+// libnut fallback (Windows / Linux, and macOS when phased-scroll is
+// unavailable). libnut.scrollMouse(x, y) is *not* a portable pixel API:
+//   - macOS:   y is a CG pixel scroll delta
+//   - Linux:   y is the number of XButton4/5 press-release pairs (1 = one
+//              wheel notch)
+//   - Windows: y is forwarded directly to MOUSEEVENTF_WHEEL's `mouseData`,
+//              where the unit is WHEEL_DELTA (= 120) per detent
+// Calling scrollMouse(0, 6) on Windows therefore sends `mouseData = 6` —
+// far below one detent — which gets silently accumulated and is frequently
+// discarded by Chromium's WheelEventQueue (Electron apps like Lark/Feishu
+// see this as "scroll did nothing"). Always emit one detent per call, and
+// pace the calls so blink doesn't coalesce them into a single tick.
+const LIBNUT_FALLBACK_PIXELS_PER_DETENT = 100;
+const LIBNUT_FALLBACK_TICK_DELAY_MS = 30;
+const LIBNUT_FALLBACK_MAX_DETENTS = 200;
+const LIBNUT_FALLBACK_DETENT_AMOUNT = process.platform === 'win32' ? 120 : 1;
+// Edge scrolls (scrollToTop / scrollToBottom / ...) must drive all the way to
+// the boundary on every backend. The phased path requests EDGE_SCROLL_TOTAL_PX
+// (50_000 px); the libnut fallback aims for the same distance, capped at
+// LIBNUT_FALLBACK_MAX_DETENTS so a misconfigured screen size can't wedge the
+// process. Chromium clamps wheel events at the boundary, so overshooting is
+// free. Exported for regression coverage.
+export const LIBNUT_FALLBACK_EDGE_DETENTS = Math.min(
+  LIBNUT_FALLBACK_MAX_DETENTS,
+  Math.max(
+    1,
+    Math.ceil(EDGE_SCROLL_TOTAL_PX / LIBNUT_FALLBACK_PIXELS_PER_DETENT),
+  ),
+);
+// Default scroll distance is 70% of the screen size on the relevant axis,
+// matching the web puppeteer/chrome-extension behavior so a model that simply
+// says "scroll down" without a distance gets a roughly one-screen scroll on
+// every platform.
+const DEFAULT_SCROLL_VIEWPORT_RATIO = 0.7;
+
+type EdgeScrollType =
+  | 'scrollToTop'
+  | 'scrollToBottom'
+  | 'scrollToLeft'
+  | 'scrollToRight';
+
+interface EdgeScrollStrategy {
+  direction: ScrollDirection;
+  key: 'home' | 'end';
+  // Unit vector for libnut.scrollMouse direction. Magnitude is applied
+  // separately by emitDetents() so each call is one full detent on every
+  // platform (see LIBNUT_FALLBACK_DETENT_AMOUNT).
+  libnut: readonly [number, number];
+}
+
+// Single source of truth for edge scroll dispatch. Adding a new scrollType
+// only requires one entry here; the three backends (phased binary /
+// AppleScript / libnut) all read from the same spec.
+const EDGE_SCROLL_SPEC: Record<EdgeScrollType, EdgeScrollStrategy> = {
+  scrollToTop: { direction: 'up', key: 'home', libnut: [0, 1] },
+  scrollToBottom: { direction: 'down', key: 'end', libnut: [0, -1] },
+  scrollToLeft: { direction: 'left', key: 'home', libnut: [-1, 0] },
+  scrollToRight: { direction: 'right', key: 'end', libnut: [1, 0] },
+};
+
+// macOS AppleScript key code mapping
+// Reference: https://eastmanreference.com/complete-list-of-applescript-key-codes
+const APPLESCRIPT_KEY_CODE_MAP: Record<string, number> = {
+  // Special keys
+  return: 36,
+  enter: 36,
+  tab: 48,
+  space: 49,
+  backspace: 51,
+  delete: 51,
+  escape: 53,
+  forwarddelete: 117,
+
+  // Arrow keys
+  left: 123,
+  right: 124,
+  down: 125,
+  up: 126,
+
+  // Navigation keys
+  home: 115,
+  end: 119,
+  pageup: 116,
+  pagedown: 121,
+
+  // Function keys
+  f1: 122,
+  f2: 120,
+  f3: 99,
+  f4: 118,
+  f5: 96,
+  f6: 97,
+  f7: 98,
+  f8: 100,
+  f9: 101,
+  f10: 109,
+  f11: 103,
+  f12: 111,
+};
+
+// Modifier key mapping for AppleScript
+const APPLESCRIPT_MODIFIER_MAP: Record<string, string> = {
+  command: 'command down',
+  cmd: 'command down',
+  control: 'control down',
+  ctrl: 'control down',
+  shift: 'shift down',
+  alt: 'option down',
+  option: 'option down',
+  meta: 'command down',
+};
+
+/**
+ * Send a key press using AppleScript (macOS only)
+ * More reliable than libnut for TUI applications like Bubble Tea
+ */
+function sendKeyViaAppleScript(key: string, modifiers: string[] = []): void {
+  const lowerKey = key.toLowerCase();
+  const keyCode = APPLESCRIPT_KEY_CODE_MAP[lowerKey];
+
+  // Build modifier string
+  const modifierParts = modifiers
+    .map((m) => APPLESCRIPT_MODIFIER_MAP[m.toLowerCase()])
+    .filter(Boolean);
+  const modifierStr =
+    modifierParts.length > 0 ? ` using {${modifierParts.join(', ')}}` : '';
+
+  let script: string;
+
+  if (keyCode !== undefined) {
+    // Use key code for special keys
+    script = `tell application "System Events" to key code ${keyCode}${modifierStr}`;
+  } else {
+    const escapedKey = key.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    script = `tell application "System Events" to keystroke "${escapedKey}"${modifierStr}`;
+  }
+
+  debugDevice('sendKeyViaAppleScript', { key, modifiers, script });
+  execFileSync('osascript', ['-e', script]);
+}
+
+// Lazy load libnut with fallback
+let libnut: LibNut | null = null;
+let libnutLoadError: Error | null = null;
+
+async function getLibnut(): Promise<LibNut> {
+  if (libnut) return libnut;
+  if (libnutLoadError) throw libnutLoadError;
+
+  try {
+    const require = createRequire(import.meta.url);
+    const libnutModule = require('@computer-use/libnut/dist/import_libnut');
+    libnut = libnutModule.libnut as LibNut;
+    if (!libnut) {
+      throw new Error('libnut module loaded but libnut object is undefined');
+    }
+    return libnut;
+  } catch (error) {
+    libnutLoadError = error as Error;
+    throw new Error(
+      `Failed to load @computer-use/libnut. Make sure it is properly installed and compiled for your platform. Error: ${error}`,
+    );
+  }
+}
+
+const debugDevice = getDebug('computer:device');
+const warnDevice = getDebug('computer:device', { console: true });
+const debugComputerInput = getDebug('computer:input', { console: true });
+const WINDOWS_UIPI_DOC_URL =
+  'https://midscenejs.com/computer-getting-started#windows-clicks-have-no-effect-on-some-apps';
+
+function resolvePackageRoot(helperName: string): string | null {
+  const require = createRequire(import.meta.url);
+  let pkgRoot: string | null = null;
+  try {
+    pkgRoot = dirname(require.resolve('@midscene/computer/package.json'));
+  } catch {
+    // Fallback for the dev/test path where the package is not resolvable by
+    // its public name (e.g. tests import from src directly).
+    const hereDir = dirname(fileURLToPath(import.meta.url));
+    for (const candidate of [
+      resolve(hereDir, '..'), // src/device.ts -> package root
+      resolve(hereDir, '../..'), // dist/{lib,es}/*.js -> package root
+    ]) {
+      if (existsSync(resolve(candidate, 'package.json'))) {
+        pkgRoot = candidate;
+        break;
+      }
+    }
+  }
+  if (!pkgRoot) {
+    debugDevice(`${helperName}: cannot locate @midscene/computer package root`);
+    return null;
+  }
+  return pkgRoot;
+}
+
+/**
+ * Resolve the phased-scroll helper binary bundled with the package.
+ *
+ * The binary is a tiny CoreGraphics helper that posts trackpad-like scroll
+ * events with proper gesture phase markers, which WebKit and modern AppKit
+ * scroll views accept without needing keyboard focus — unlike libnut's
+ * phase-less CGScrollEvent path.
+ *
+ * Returns null on non-darwin or when the binary is missing (expected if a
+ * consumer stripped the optional `bin/darwin/` directory from their install).
+ */
+let phasedScrollBinaryPath: string | null | undefined;
+/** @internal exported for unit tests — do not consume from outside this package */
+export function getPhasedScrollBinary(): string | null {
+  if (phasedScrollBinaryPath !== undefined) return phasedScrollBinaryPath;
+  if (process.platform !== 'darwin') {
+    phasedScrollBinaryPath = null;
+    return null;
+  }
+
+  const pkgRoot = resolvePackageRoot('phased-scroll');
+  if (!pkgRoot) {
+    phasedScrollBinaryPath = null;
+    return null;
+  }
+
+  const binPath = resolve(pkgRoot, 'bin/darwin/phased-scroll');
+  if (!existsSync(binPath)) {
+    debugDevice('phased-scroll binary not found at', binPath);
+    phasedScrollBinaryPath = null;
+    return null;
+  }
+  // npm tarball extraction drops the executable bit on packed files (mode
+  // becomes 0644). Self-heal once at resolution time so spawnSync doesn't
+  // come back with status:null/EACCES on every scroll.
+  try {
+    const st = statSync(binPath);
+    if ((st.mode & 0o111) === 0) {
+      chmodSync(binPath, 0o755);
+      debugDevice('phased-scroll: restored executable bit on', binPath);
+    }
+  } catch (err) {
+    debugDevice('phased-scroll: chmod self-heal failed', err);
+  }
+  phasedScrollBinaryPath = binPath;
+  return binPath;
+}
+
+let displayInfoBinaryPath: string | null | undefined;
+/** @internal exported for unit tests — do not consume from outside this package */
+export function getDisplayInfoBinary(): string | null {
+  if (displayInfoBinaryPath !== undefined) return displayInfoBinaryPath;
+  if (process.platform !== 'darwin') {
+    displayInfoBinaryPath = null;
+    return null;
+  }
+
+  const pkgRoot = resolvePackageRoot('display-info');
+  if (!pkgRoot) {
+    displayInfoBinaryPath = null;
+    return null;
+  }
+
+  const binPath = resolve(pkgRoot, 'bin/darwin/display-info');
+  if (!existsSync(binPath)) {
+    debugDevice('display-info binary not found at', binPath);
+    displayInfoBinaryPath = null;
+    return null;
+  }
+  displayInfoBinaryPath = binPath;
+  return binPath;
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function isDarwinDisplayGeometry(
+  value: unknown,
+): value is DarwinDisplayGeometry {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as DarwinDisplayGeometry;
+  return (
+    Number.isInteger(candidate.screenIndex) &&
+    Number.isInteger(candidate.cgDisplayId) &&
+    typeof candidate.primary === 'boolean' &&
+    !!candidate.bounds &&
+    isFiniteNumber(candidate.bounds.x) &&
+    isFiniteNumber(candidate.bounds.y) &&
+    isFiniteNumber(candidate.bounds.width) &&
+    isFiniteNumber(candidate.bounds.height)
+  );
+}
+
+/** @internal exported for unit tests — do not consume from outside this package */
+export function readDarwinDisplayGeometries(): DarwinDisplayGeometry[] {
+  const bin = getDisplayInfoBinary();
+  if (!bin) return [];
+
+  try {
+    const output = execFileSync(bin, [], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const parsed = JSON.parse(output) as NativeDisplayInfoResponse;
+    return Array.isArray(parsed.displays)
+      ? parsed.displays.filter(isDarwinDisplayGeometry)
+      : [];
+  } catch (error) {
+    debugDevice('display-info helper failed:', error);
+    return [];
+  }
+}
+
+function readDarwinFrontmostApplication():
+  | DarwinFrontmostApplication
+  | undefined {
+  try {
+    const output = execFileSync('osascript', [
+      '-e',
+      [
+        'tell application "System Events"',
+        'set frontApp to first application process whose frontmost is true',
+        'return (unix id of frontApp as string) & "\t" & (name of frontApp as string)',
+        'end tell',
+      ].join('\n'),
+    ])
+      .toString()
+      .trim();
+    const [pidText, ...nameParts] = output.split('\t');
+    const pid = Number(pidText);
+    if (!Number.isInteger(pid) || pid <= 0) return undefined;
+    return { pid, name: nameParts.join('\t') };
+  } catch (error) {
+    debugDevice('Failed to read macOS frontmost application:', error);
+    return undefined;
+  }
+}
+
+async function pressMouseAtGlobalPoint(
+  inputDriver: ComputerInputDriver,
+  targetX: number,
+  targetY: number,
+  holdDuration: number,
+  reason: 'primary' | 'focus-follow-up',
+): Promise<void> {
+  await inputDriver.delay(CLICK_SETTLE_DELAY);
+  const current = inputDriver.getMousePos();
+  debugComputerInput('tap mouse moved %o', {
+    reason,
+    target: { x: targetX, y: targetY },
+    current,
+    drift: { x: current.x - targetX, y: current.y - targetY },
+  });
+  await inputDriver.withMouseButton('left', async () => {
+    debugComputerInput('tap mouse down %o', { reason });
+    await inputDriver.delay(holdDuration);
+  });
+  debugComputerInput('tap mouse up %o', { reason });
+}
+
+/** @internal exported for unit tests — do not consume from outside this package */
+export function resolveDarwinDisplayGeometryFromList(
+  displayId: string | undefined,
+  displays: DarwinDisplayGeometry[],
+): DarwinDisplayGeometry | undefined {
+  if (!displays.length) return undefined;
+  const screenIndex =
+    displayId === undefined || displayId === '' ? 0 : Number(displayId);
+  if (!Number.isInteger(screenIndex) || screenIndex < 0) {
+    debugDevice('Invalid macOS display id for display geometry:', displayId);
+    return undefined;
+  }
+  if (displayId === undefined || displayId === '') {
+    return (
+      displays.find((display) => display.primary) ||
+      displays.find((display) => display.screenIndex === 0) ||
+      displays[0]
+    );
+  }
+  return (
+    displays.find((display) => display.screenIndex === screenIndex) ||
+    displays.find((display) => display.cgDisplayId === screenIndex)
+  );
+}
+
+function resolveDisplayGeometry(
+  displayId: string | undefined,
+): DarwinDisplayGeometry | undefined {
+  if (process.platform !== 'darwin') return undefined;
+  return resolveDarwinDisplayGeometryFromList(
+    displayId,
+    readDarwinDisplayGeometries(),
+  );
+}
+
+/** @internal exported for unit tests — do not consume from outside this package */
+export function mapDisplayLocalPointToGlobal(
+  point: Point,
+  geometry?: DarwinDisplayGeometry,
+): Point {
+  if (!geometry) return point;
+  return {
+    x: point.x + geometry.bounds.x,
+    y: point.y + geometry.bounds.y,
+  };
+}
+
+let phasedScrollExecWarned = false;
+/** @internal exported for unit tests — do not consume from outside this package */
+export function runPhasedScroll(
+  direction: ScrollDirection,
+  pixels: number,
+  steps: number,
+): boolean {
+  const bin = getPhasedScrollBinary();
+  if (!bin) return false;
+  // phased-scroll posts events at the current cursor location — callers that
+  // care about routing should move the mouse before invoking.
+  try {
+    const res = spawnSync(
+      bin,
+      [direction, String(Math.max(1, Math.round(pixels))), String(steps)],
+      { stdio: 'ignore' },
+    );
+    if (res.status === 0) return true;
+    if (!phasedScrollExecWarned) {
+      phasedScrollExecWarned = true;
+      // status === null means the child was killed by a signal before it
+      // could exit normally — usually EACCES (binary not executable) or a
+      // codesign/quarantine rejection. status !== 0 means the helper exited
+      // on its own; on macOS that's almost always Accessibility denial.
+      const hint =
+        res.status === null
+          ? `signal ${res.signal ?? 'unknown'}; the binary may not be executable (npm tarball extraction can drop the +x bit) or may be blocked by quarantine. Try: chmod +x "${bin}"`
+          : 'this usually means Accessibility permission has not been granted to the host process (System Settings → Privacy & Security → Accessibility)';
+      console.warn(
+        `[@midscene/computer] phased-scroll helper failed (exit=${res.status}, signal=${res.signal ?? 'none'}); falling back to keyboard/libnut. ${hint}`,
+      );
+    }
+    debugDevice(
+      'phased-scroll exited non-zero',
+      res.status,
+      res.signal,
+      res.error,
+    );
+    return false;
+  } catch (err) {
+    if (!phasedScrollExecWarned) {
+      phasedScrollExecWarned = true;
+      console.warn(
+        `[@midscene/computer] phased-scroll helper failed to spawn (${(err as Error)?.message}); falling back to keyboard/libnut.`,
+      );
+    }
+    debugDevice('phased-scroll spawn failed', err);
+    return false;
+  }
+}
+
+// Key name mapping for cross-platform compatibility
+// Note: Modifier keys have different names when used as primary key vs modifier
+const KEY_NAME_MAP: Record<string, string> = {
+  // Modifier keys (for use in modifiers array)
+  windows: 'win',
+  win: 'win',
+  ctrl: 'control',
+  esc: 'escape',
+  del: 'delete',
+  ins: 'insert',
+  // Navigation keys
+  pgup: 'pageup',
+  pgdn: 'pagedown',
+  arrowup: 'up',
+  arrowdown: 'down',
+  arrowleft: 'left',
+  arrowright: 'right',
+  // Media keys
+  volumedown: 'audio_vol_down',
+  volumeup: 'audio_vol_up',
+  mediavolumedown: 'audio_vol_down',
+  mediavolumeup: 'audio_vol_up',
+  mute: 'audio_mute',
+  mediamute: 'audio_mute',
+  mediaplay: 'audio_play',
+  mediapause: 'audio_pause',
+  mediaplaypause: 'audio_play',
+  mediastop: 'audio_stop',
+  medianexttrack: 'audio_next',
+  mediaprevioustrack: 'audio_prev',
+  medianext: 'audio_next',
+  mediaprev: 'audio_prev',
+};
+
+// When pressing modifier keys alone (as primary key), use these names
+// This is needed because libnut requires different key names for modifiers
+// when they are the main key vs when they are in the modifiers array
+const PRIMARY_KEY_MAP: Record<string, string> = {
+  command: 'cmd',
+  cmd: 'cmd',
+  meta: 'meta',
+  control: 'control',
+  ctrl: 'control',
+  shift: 'shift',
+  alt: 'alt',
+  option: 'alt',
+};
+
+function normalizeKeyName(key: string): string {
+  const lowerKey = key.toLowerCase();
+  return KEY_NAME_MAP[lowerKey] || lowerKey;
+}
+
+function normalizePrimaryKey(key: string): string {
+  const lowerKey = key.toLowerCase();
+  // First check PRIMARY_KEY_MAP for modifier keys pressed alone
+  if (PRIMARY_KEY_MAP[lowerKey]) {
+    return PRIMARY_KEY_MAP[lowerKey];
+  }
+  // Then use regular KEY_NAME_MAP
+  return KEY_NAME_MAP[lowerKey] || lowerKey;
+}
+
+export interface DisplayInfo {
+  id: string;
+  name: string;
+  primary?: boolean;
+}
+
+export interface ComputerDeviceOpt {
+  displayId?: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  customActions?: DeviceAction<any>[];
+  /**
+   * Keyboard driver for sending key events (macOS only)
+   * - 'applescript': Use AppleScript via osascript (default on macOS, more reliable)
+   * - 'libnut': Use libnut's keyTap (faster but may not work with some TUI apps)
+   */
+  keyboardDriver?: 'applescript' | 'libnut';
+  /**
+   * Headless mode via Xvfb (Linux only).
+   * - true: start Xvfb virtual display
+   * - false/undefined: do not start Xvfb
+   * Can also be set via MIDSCENE_COMPUTER_HEADLESS_LINUX=true environment variable.
+   */
+  headless?: boolean;
+  /**
+   * Resolution for Xvfb virtual display (default '1920x1080x24')
+   */
+  xvfbResolution?: string;
+}
+
+export class ComputerDevice implements AbstractInterface {
+  interfaceType: InterfaceType = 'computer';
+  private options?: ComputerDeviceOpt;
+  private displayId?: string;
+  private displayGeometry?: DarwinDisplayGeometry;
+  private description?: string;
+  private destroyed = false;
+  private xvfbInstance?: XvfbInstance;
+  private xvfbCleanup?: () => void;
+  private readonly inputDriver = new ComputerInputDriver({
+    getLibnut: () => libnut,
+    useAppleScript: () => this.useAppleScript,
+    sendKeyViaAppleScript,
+    runPhasedScroll,
+    debug: (message) => debugDevice(message),
+  });
+  /**
+   * On macOS, use AppleScript for keyboard operations by default
+   * to avoid focus issues with system overlays (e.g. Spotlight).
+   */
+  private useAppleScript: boolean;
+  /** Cached result of the elevation check; see isRunningAsAdmin(). */
+  private adminCheckCache?: boolean;
+  uri?: string;
+
+  readonly inputPrimitives: ComputerInputPrimitives = {
+    pointer: {
+      tap: async ({ x, y }, opts) => {
+        const target = this.toGlobalPoint({ x, y });
+        const targetX = Math.round(target.x);
+        const targetY = Math.round(target.y);
+        const holdDuration = Math.max(
+          0,
+          Math.round(opts?.duration ?? CLICK_HOLD_DURATION),
+        );
+        debugComputerInput('tap start %o', {
+          local: { x, y },
+          global: { x: targetX, y: targetY },
+          holdDuration,
+          displayId: this.displayId,
+          displayGeometry: this.displayGeometry
+            ? {
+                screenIndex: this.displayGeometry.screenIndex,
+                cgDisplayId: this.displayGeometry.cgDisplayId,
+                bounds: this.displayGeometry.bounds,
+              }
+            : undefined,
+        });
+
+        const frontmostBefore =
+          process.platform === 'darwin'
+            ? readDarwinFrontmostApplication()
+            : undefined;
+        await this.inputDriver.smoothMoveMouse(
+          targetX,
+          targetY,
+          SMOOTH_MOVE_STEPS_TAP,
+          SMOOTH_MOVE_DELAY_TAP,
+        );
+        await pressMouseAtGlobalPoint(
+          this.inputDriver,
+          targetX,
+          targetY,
+          holdDuration,
+          'primary',
+        );
+
+        if (frontmostBefore && process.platform === 'darwin') {
+          await sleep(CLICK_FOCUS_SETTLE_DELAY);
+          const frontmostAfter = readDarwinFrontmostApplication();
+          const focusChanged =
+            !!frontmostAfter && frontmostAfter.pid !== frontmostBefore.pid;
+          debugComputerInput('tap focus check %o', {
+            before: frontmostBefore,
+            after: frontmostAfter,
+            focusChanged,
+          });
+          if (focusChanged) {
+            this.inputDriver.moveMouse(targetX, targetY);
+            await pressMouseAtGlobalPoint(
+              this.inputDriver,
+              targetX,
+              targetY,
+              holdDuration,
+              'focus-follow-up',
+            );
+          }
+        }
+      },
+      doubleClick: async ({ x, y }) => {
+        const target = this.toGlobalPoint({ x, y });
+        this.inputDriver.moveMouse(Math.round(target.x), Math.round(target.y));
+        this.inputDriver.mouseClick('left', true);
+      },
+      rightClick: async ({ x, y }) => {
+        const target = this.toGlobalPoint({ x, y });
+        this.inputDriver.moveMouse(Math.round(target.x), Math.round(target.y));
+        this.inputDriver.mouseClick('right');
+      },
+      hover: async ({ x, y }) => {
+        const target = this.toGlobalPoint({ x, y });
+        await this.inputDriver.smoothMoveMouse(
+          Math.round(target.x),
+          Math.round(target.y),
+          SMOOTH_MOVE_STEPS_MOUSE_MOVE,
+          SMOOTH_MOVE_DELAY_MOUSE_MOVE,
+        );
+        await this.inputDriver.delay(MOUSE_MOVE_EFFECT_WAIT);
+      },
+      dragAndDrop: async (from, to) => {
+        const globalFrom = this.toGlobalPoint(from);
+        const globalTo = this.toGlobalPoint(to);
+        this.inputDriver.moveMouse(
+          Math.round(globalFrom.x),
+          Math.round(globalFrom.y),
+        );
+        await this.inputDriver.withMouseButton('left', async () => {
+          await this.inputDriver.delay(100);
+          this.inputDriver.moveMouse(
+            Math.round(globalTo.x),
+            Math.round(globalTo.y),
+          );
+          await this.inputDriver.delay(100);
+        });
+      },
+    },
+    keyboard: {
+      typeText: async (value, opts) => {
+        const element = opts?.target as LocateResultElement | undefined;
+
+        if (element) {
+          const [x, y] = element.center;
+          const target = this.toGlobalPoint({ x, y });
+          this.inputDriver.moveMouse(
+            Math.round(target.x),
+            Math.round(target.y),
+          );
+          this.inputDriver.mouseClick('left');
+          await this.inputDriver.delay(INPUT_FOCUS_DELAY);
+
+          if (opts?.replace !== false) {
+            await this.selectAllAndDelete();
+            await this.inputDriver.delay(INPUT_CLEAR_DELAY);
+          }
+        }
+
+        await this.smartTypeString(value);
+      },
+      keyboardPress: async (keyName, opts) => {
+        const target = opts?.target as LocateResultElement | undefined;
+        if (target) {
+          const [x, y] = target.center;
+          const point = this.toGlobalPoint({ x, y });
+          this.inputDriver.moveMouse(Math.round(point.x), Math.round(point.y));
+          this.inputDriver.mouseClick('left');
+          await this.inputDriver.delay(50);
+        }
+
+        await this.pressKeyboardShortcut(keyName);
+      },
+      clearInput: async (target) => {
+        if (target) {
+          const element = target as LocateResultElement;
+          const [x, y] = element.center;
+          const point = this.toGlobalPoint({ x, y });
+          this.inputDriver.moveMouse(Math.round(point.x), Math.round(point.y));
+          this.inputDriver.mouseClick('left');
+          await this.inputDriver.delay(100);
+        }
+
+        await this.selectAllAndDelete();
+        await this.inputDriver.delay(50);
+      },
+    },
+    scroll: {
+      scroll: async (param) => {
+        await this.performScroll(param);
+      },
+    },
+  };
+
+  constructor(options?: ComputerDeviceOpt) {
+    this.options = options;
+    this.displayId = options?.displayId;
+    this.useAppleScript =
+      process.platform === 'darwin' && options?.keyboardDriver !== 'libnut';
+  }
+
+  describe(): string {
+    return this.description || 'Computer Device';
+  }
+
+  /**
+   * Get all available displays
+   */
+  static async listDisplays(): Promise<DisplayInfo[]> {
+    try {
+      const displays: ScreenshotDisplay[] = await screenshot.listDisplays();
+      return displays.map((d) => ({
+        id: String(d.id),
+        name: d.name || `Display ${d.id}`,
+        primary: d.primary || false,
+      }));
+    } catch (error) {
+      debugDevice(`Failed to list displays: ${error}`);
+      return [];
+    }
+  }
+
+  async connect(): Promise<void> {
+    debugDevice('Connecting to computer device');
+
+    try {
+      // Start Xvfb if explicitly requested (option or env var)
+      const headless =
+        this.options?.headless ??
+        process.env.MIDSCENE_COMPUTER_HEADLESS_LINUX === 'true';
+      if (needsXvfb(headless)) {
+        if (!checkXvfbInstalled()) {
+          throw new Error(
+            'Xvfb is required for headless mode but not installed. Install: sudo apt-get install xvfb',
+          );
+        }
+        this.xvfbInstance = await startXvfb({
+          resolution: this.options?.xvfbResolution,
+        });
+        process.env.DISPLAY = this.xvfbInstance.display;
+        debugDevice(`Xvfb started on display ${this.xvfbInstance.display}`);
+
+        // Clean up Xvfb on process exit (stored for removal in destroy())
+        this.xvfbCleanup = () => {
+          if (this.xvfbInstance) {
+            this.xvfbInstance.stop();
+            this.xvfbInstance = undefined;
+          }
+        };
+        process.on('exit', this.xvfbCleanup);
+        process.on('SIGINT', this.xvfbCleanup);
+        process.on('SIGTERM', this.xvfbCleanup);
+      }
+
+      // Load libnut on first connect
+      libnut = await getLibnut();
+      this.displayGeometry = resolveDisplayGeometry(this.displayId);
+
+      const size = await this.size();
+      const displays = await ComputerDevice.listDisplays();
+
+      const headlessInfo = this.xvfbInstance
+        ? `\nHeadless: true (Xvfb on ${this.xvfbInstance.display})`
+        : '';
+
+      this.description = `
+Type: Computer
+Platform: ${process.platform}
+Display: ${this.displayId || 'Primary'}
+Screen Size: ${size.width}x${size.height}
+Available Displays: ${displays.length > 0 ? displays.map((d) => d.name).join(', ') : 'Unknown'}${headlessInfo}
+`;
+      debugDevice('Computer device connected', this.description);
+      // Health check: verify screenshot and mouse control are working
+      await this.healthCheck();
+    } catch (error) {
+      // Clean up Xvfb on connection failure
+      if (this.xvfbInstance) {
+        this.xvfbInstance.stop();
+        this.xvfbInstance = undefined;
+      }
+      debugDevice(`Failed to connect: ${error}`);
+      throw new Error(`Unable to connect to computer device: ${error}`);
+    }
+  }
+
+  private async healthCheck(): Promise<void> {
+    console.log('[HealthCheck] Starting health check...');
+    console.log(`[HealthCheck] @midscene/computer v${__VERSION__}`);
+
+    // Step 1: Take a screenshot (with timeout to handle screenshot-desktop
+    // hanging when xrandr is missing on Linux — its promise never settles)
+    console.log('[HealthCheck] Taking screenshot...');
+    const screenshotTimeout = 15_000;
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutId = setTimeout(
+        () => reject(new Error('Screenshot timed out')),
+        screenshotTimeout,
+      );
+    });
+    const base64 = await Promise.race([
+      this.screenshotBase64().finally(() => clearTimeout(timeoutId)),
+      timeoutPromise,
+    ]);
+    console.log(`[HealthCheck] Screenshot succeeded (length=${base64.length})`);
+
+    // Step 2: Move the mouse
+    console.log('[HealthCheck] Moving mouse...');
+    const startPos = this.inputDriver.getMousePos();
+    console.log(
+      `[HealthCheck] Current mouse position: (${startPos.x}, ${startPos.y})`,
+    );
+
+    // Move the mouse by a small random offset, then move it back
+    const offsetX = Math.floor(Math.random() * 40) + 10;
+    const offsetY = Math.floor(Math.random() * 40) + 10;
+    const targetX = startPos.x + offsetX;
+    const targetY = startPos.y + offsetY;
+
+    console.log(`[HealthCheck] Moving mouse to (${targetX}, ${targetY})...`);
+    this.inputDriver.moveMouse(targetX, targetY);
+    await sleep(50);
+
+    const movedPos = this.inputDriver.getMousePos();
+    console.log(
+      `[HealthCheck] Mouse position after move: (${movedPos.x}, ${movedPos.y})`,
+    );
+
+    // Detect if moveMouse actually worked
+    const deltaX = Math.abs(movedPos.x - targetX);
+    const deltaY = Math.abs(movedPos.y - targetY);
+    if (deltaX > 5 || deltaY > 5) {
+      const msg = `[HealthCheck] WARNING: Mouse control may not be working. Expected (${targetX}, ${targetY}), got (${movedPos.x}, ${movedPos.y}), delta=(${deltaX}, ${deltaY})`;
+      warnDevice(msg);
+    }
+
+    // Windows UIPI advisory. This must NOT be gated on the moveMouse delta
+    // check above: UIPI does not block cursor movement, it only silently
+    // drops button/key input injected into an elevated (admin) window. So a
+    // non-admin process can pass the move test yet have every click land on
+    // nothing — clicks "do nothing" while the cursor visibly moves to the
+    // right spot. We cannot tell from here whether the target app is actually
+    // elevated, so phrase this as a conditional heads-up (keyed off the
+    // observable symptom) rather than asserting something is wrong — most
+    // non-admin sessions target non-admin apps and work fine.
+    if (process.platform === 'win32' && !this.isRunningAsAdmin()) {
+      const hint = [
+        'Heads-up: Midscene is not running as Administrator.',
+        'If clicks or key presses have no effect while the cursor still moves to the right position,',
+        `see the Windows permission troubleshooting guide: ${WINDOWS_UIPI_DOC_URL}`,
+      ].join(' ');
+      warnDevice(`[HealthCheck] ${hint}`);
+    }
+
+    // Restore original position
+    this.inputDriver.moveMouse(startPos.x, startPos.y);
+    console.log(
+      `[HealthCheck] Mouse restored to (${startPos.x}, ${startPos.y})`,
+    );
+
+    // Step 3: List available monitors
+    console.log('[HealthCheck] Listing monitors...');
+    const displays = await ComputerDevice.listDisplays();
+    if (displays.length > 0) {
+      console.log(`[HealthCheck] Found ${displays.length} monitor(s):`);
+      for (const display of displays) {
+        const primaryTag = display.primary ? ' (primary)' : '';
+        console.log(
+          `[HealthCheck]   - id=${display.id}, name=${display.name}${primaryTag}`,
+        );
+      }
+    } else {
+      console.log('[HealthCheck] No monitors detected');
+    }
+
+    console.log('[HealthCheck] Health check passed');
+  }
+
+  /**
+   * Check if the current process is running with Administrator privileges.
+   * Uses "net session" which succeeds only when elevated.
+   *
+   * The result is cached because elevation cannot change during the process
+   * lifetime, and the underlying `execSync('net session')` is a blocking
+   * subprocess spawn that should not run on every connect / health check.
+   */
+  private isRunningAsAdmin(): boolean {
+    if (process.platform !== 'win32') return false;
+    if (this.adminCheckCache !== undefined) return this.adminCheckCache;
+    try {
+      execSync('net session', { stdio: 'pipe' });
+      this.adminCheckCache = true;
+    } catch {
+      this.adminCheckCache = false;
+    }
+    return this.adminCheckCache;
+  }
+
+  async screenshotBase64(): Promise<string> {
+    if (this.destroyed) {
+      throw new Error('ComputerDevice has been destroyed');
+    }
+    debugDevice('Taking screenshot', { displayId: this.displayId });
+
+    const options: ScreenshotOptions = { format: 'png' };
+    if (this.displayId !== undefined) {
+      // On macOS: displayId is screenshot-desktop's screen index.
+      // On Windows: displayId is string like "\\.\DISPLAY1"
+      // On Linux: displayId is string like ":0.0"
+      if (process.platform === 'darwin') {
+        const screenIndex = Number(this.displayId);
+        if (!Number.isNaN(screenIndex)) {
+          options.screen = screenIndex;
+        }
+      } else {
+        // Windows and Linux use string IDs directly
+        options.screen = this.displayId;
+      }
+    }
+    debugDevice('Screenshot options', options);
+
+    // macOS `screencapture` returns "could not create image from display"
+    // both for missing TCC Screen Recording permission AND for transient
+    // CGDisplay states (display sleep/wake, Space switch, fullscreen
+    // transition, secure input briefly held by System Settings, etc.).
+    // Real permission failures stay broken across retries, so a short
+    // retry burst recovers from the transient case without papering over
+    // genuine misconfiguration.
+    const MAX_ATTEMPTS = 3;
+    const RETRY_DELAY_MS = 300;
+    let lastRawMessage = '';
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        const buffer: Buffer = await screenshot(options);
+        if (attempt > 1) {
+          debugDevice(`Screenshot succeeded on attempt ${attempt}`);
+        }
+        return createImgBase64ByFormat('png', buffer.toString('base64'));
+      } catch (error) {
+        lastRawMessage = error instanceof Error ? error.message : String(error);
+        const isMacTransient =
+          process.platform === 'darwin' &&
+          /could not create image from display/i.test(lastRawMessage);
+        const willRetry = isMacTransient && attempt < MAX_ATTEMPTS;
+        debugDevice(
+          `Screenshot attempt ${attempt} failed: ${lastRawMessage}${willRetry ? ' — retrying' : ''}`,
+        );
+        if (!willRetry) {
+          break;
+        }
+        await sleep(RETRY_DELAY_MS);
+      }
+    }
+
+    if (
+      process.platform === 'darwin' &&
+      /could not create image from display/i.test(lastRawMessage)
+    ) {
+      throw new Error(
+        `Failed to take screenshot on macOS: the host process is missing Screen Recording permission, or the target display is locked/sleeping.
+
+Please follow these steps:
+1. Open System Settings > Privacy & Security > Screen Recording
+2. Enable the application running this script (e.g., Terminal, iTerm2, VS Code, WebStorm, or Midscene Studio)
+3. Fully quit and relaunch that application after granting permission — macOS only re-reads this permission on process launch.
+
+Original error: ${lastRawMessage}`,
+      );
+    }
+    throw new Error(`Failed to take screenshot: ${lastRawMessage}`);
+  }
+
+  async size(): Promise<Size> {
+    if (this.displayGeometry) {
+      return {
+        width: Math.round(this.displayGeometry.bounds.width),
+        height: Math.round(this.displayGeometry.bounds.height),
+      };
+    }
+
+    try {
+      const screenSize = this.inputDriver.getScreenSize();
+      return {
+        width: screenSize.width,
+        height: screenSize.height,
+      };
+    } catch (error) {
+      debugDevice(`Failed to get screen size: ${error}`);
+      throw new Error(`Failed to get screen size: ${error}`);
+    }
+  }
+
+  private toGlobalPoint(point: Point): Point {
+    return mapDisplayLocalPointToGlobal(point, this.displayGeometry);
+  }
+
+  /**
+   * Type text via clipboard (paste)
+   * This method:
+   * 1. Saves the old clipboard content
+   * 2. Writes new content to clipboard
+   * 3. Simulates paste shortcut (Ctrl+V / Cmd+V)
+   * 4. Restores old clipboard content
+   */
+  private async typeViaClipboard(text: string): Promise<void> {
+    debugDevice('Using clipboard to input text', {
+      textLength: text.length,
+      preview: text.substring(0, 20),
+    });
+
+    const clipboardy = await import('clipboardy');
+    // 1. Save old clipboard content
+    const oldClipboard = await clipboardy.default.read().catch(() => '');
+
+    try {
+      // 2. Write new content to clipboard
+      await clipboardy.default.write(text);
+      await this.inputDriver.delay(50);
+
+      // 3. Simulate paste shortcut
+      if (this.useAppleScript) {
+        this.inputDriver.sendKeyViaAppleScript('v', ['command']);
+      } else {
+        const modifier = process.platform === 'darwin' ? 'command' : 'control';
+        this.inputDriver.keyTap('v', [modifier]);
+      }
+      await this.inputDriver.delay(100);
+    } finally {
+      // 4. Restore old clipboard content
+      if (oldClipboard) {
+        await clipboardy.default.write(oldClipboard).catch(() => {
+          // Silent fail - don't affect main flow
+          debugDevice('Failed to restore clipboard content');
+        });
+      }
+    }
+  }
+
+  /**
+   * Always use clipboard paste to input text, avoiding IME interference.
+   * Keystroke-based input (AppleScript/libnut) goes through the active input method,
+   * which can swallow characters or convert them when a non-English IME is active.
+   */
+  private async smartTypeString(text: string): Promise<void> {
+    await this.typeViaClipboard(text);
+  }
+
+  private async selectAllAndDelete(): Promise<void> {
+    if (this.useAppleScript) {
+      this.inputDriver.sendKeyViaAppleScript('a', ['command']);
+      await this.inputDriver.delay(50);
+      this.inputDriver.sendKeyViaAppleScript('backspace', []);
+      return;
+    }
+
+    const modifier = process.platform === 'darwin' ? 'command' : 'control';
+    this.inputDriver.keyTap('a', [modifier]);
+    await this.inputDriver.delay(50);
+    this.inputDriver.keyTap('backspace');
+  }
+
+  private async pressKeyboardShortcut(keyName: string): Promise<void> {
+    const keys = keyName.split('+');
+    const modifiers = keys.slice(0, -1).map(normalizeKeyName);
+    const key = normalizePrimaryKey(keys[keys.length - 1]);
+
+    debugDevice('KeyboardPress', {
+      original: keyName,
+      key,
+      modifiers,
+      driver: this.useAppleScript ? 'applescript' : 'libnut',
+    });
+
+    this.inputDriver.sendKey(key, modifiers);
+  }
+
+  private resolveUntargetedScrollPoint(screenSize: Size): Point {
+    if (process.platform === 'win32') {
+      const activeWindowRect = this.inputDriver.getActiveWindowRect();
+      if (activeWindowRect) {
+        return {
+          x: activeWindowRect.x + activeWindowRect.width / 2,
+          y: activeWindowRect.y + activeWindowRect.height / 2,
+        };
+      }
+    }
+
+    return this.toGlobalPoint({
+      x: screenSize.width / 2,
+      y: screenSize.height / 2,
+    });
+  }
+
+  private async moveMouseToScrollTarget(param: any): Promise<Size | undefined> {
+    if (param.locate) {
+      const element = param.locate as LocateResultElement;
+      const [x, y] = element.center;
+      const point = this.toGlobalPoint({ x, y });
+      this.inputDriver.moveMouse(Math.round(point.x), Math.round(point.y));
+      return undefined;
+    }
+
+    // Wheel events are delivered to the window under the cursor. For an
+    // untargeted "scroll down", anchor the cursor in the active viewport
+    // instead of relying on wherever the previous action left it.
+    const screenSize = await this.size();
+    if (process.platform === 'win32' && this.inputDriver.focusActiveWindow()) {
+      await this.inputDriver.delay(CLICK_FOCUS_SETTLE_DELAY);
+    }
+    const point = this.resolveUntargetedScrollPoint(screenSize);
+    this.inputDriver.moveMouse(Math.round(point.x), Math.round(point.y));
+    await this.inputDriver.delay(MOUSE_MOVE_EFFECT_WAIT);
+    return screenSize;
+  }
+
+  private async performScroll(param: any): Promise<void> {
+    let screenSize = await this.moveMouseToScrollTarget(param);
+
+    const scrollType = param?.scrollType;
+
+    const edgeSpec =
+      scrollType && scrollType in EDGE_SCROLL_SPEC
+        ? EDGE_SCROLL_SPEC[scrollType as EdgeScrollType]
+        : null;
+    if (edgeSpec) {
+      if (
+        this.inputDriver.runPhasedScroll(
+          edgeSpec.direction,
+          EDGE_SCROLL_TOTAL_PX,
+          EDGE_SCROLL_STEPS,
+        )
+      ) {
+        await this.inputDriver.delay(SCROLL_COMPLETE_DELAY);
+        return;
+      }
+
+      if (this.useAppleScript) {
+        this.inputDriver.sendKeyViaAppleScript(edgeSpec.key);
+        await this.inputDriver.delay(SCROLL_COMPLETE_DELAY);
+        return;
+      }
+
+      const [ux, uy] = edgeSpec.libnut;
+      await this.inputDriver.emitScrollDetents(
+        ux * LIBNUT_FALLBACK_DETENT_AMOUNT,
+        uy * LIBNUT_FALLBACK_DETENT_AMOUNT,
+        LIBNUT_FALLBACK_EDGE_DETENTS,
+        LIBNUT_FALLBACK_TICK_DELAY_MS,
+      );
+      return;
+    }
+
+    if (scrollType === 'singleAction' || !scrollType) {
+      const direction = (param?.direction || 'down') as ScrollDirection;
+      const isKnownDirection =
+        direction === 'up' ||
+        direction === 'down' ||
+        direction === 'left' ||
+        direction === 'right';
+      const isHorizontal = direction === 'left' || direction === 'right';
+
+      let distance: number | undefined = param?.distance ?? undefined;
+      if (!distance) {
+        screenSize ??= await this.size();
+        const base = isHorizontal ? screenSize.width : screenSize.height;
+        distance = Math.max(
+          1,
+          Math.round(base * DEFAULT_SCROLL_VIEWPORT_RATIO),
+        );
+      }
+
+      if (isKnownDirection) {
+        const steps = Math.max(
+          PHASED_MIN_STEPS,
+          Math.round(distance / PHASED_PIXELS_PER_STEP),
+        );
+        if (this.inputDriver.runPhasedScroll(direction, distance, steps)) {
+          await this.inputDriver.delay(SCROLL_COMPLETE_DELAY);
+          return;
+        }
+      }
+
+      if (this.useAppleScript && (direction === 'up' || direction === 'down')) {
+        if (!screenSize) screenSize = await this.size();
+        const pages = Math.max(1, Math.round(distance / screenSize.height));
+        const key = direction === 'up' ? 'pageup' : 'pagedown';
+        for (let i = 0; i < pages; i++) {
+          this.inputDriver.sendKeyViaAppleScript(key);
+          await this.inputDriver.delay(SCROLL_STEP_DELAY);
+        }
+        await this.inputDriver.delay(SCROLL_COMPLETE_DELAY);
+        return;
+      }
+
+      const detents = Math.min(
+        LIBNUT_FALLBACK_MAX_DETENTS,
+        Math.max(1, Math.ceil(distance / LIBNUT_FALLBACK_PIXELS_PER_DETENT)),
+      );
+      const directionUnit: Record<string, [number, number]> = {
+        up: [0, 1],
+        down: [0, -1],
+        left: [-1, 0],
+        right: [1, 0],
+      };
+      const [ux, uy] = directionUnit[direction] || [0, -1];
+      await this.inputDriver.emitScrollDetents(
+        ux * LIBNUT_FALLBACK_DETENT_AMOUNT,
+        uy * LIBNUT_FALLBACK_DETENT_AMOUNT,
+        detents,
+        LIBNUT_FALLBACK_TICK_DELAY_MS,
+      );
+      await this.inputDriver.delay(SCROLL_COMPLETE_DELAY);
+      return;
+    }
+
+    throw new Error(
+      `Unknown scroll type: ${scrollType}, param: ${JSON.stringify(param)}`,
+    );
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  actionSpace(): DeviceAction<any>[] {
+    const defaultActions: DeviceAction<any>[] = [
+      ...defineActionsFromInputPrimitives(this.inputPrimitives),
+    ];
+
+    const platformActions = Object.values(createPlatformActions());
+    const customActions = this.options?.customActions || [];
+
+    return [...defaultActions, ...platformActions, ...customActions];
+  }
+
+  async destroy(): Promise<void> {
+    if (this.destroyed) {
+      return;
+    }
+
+    this.destroyed = true;
+    this.inputDriver.destroy();
+
+    if (this.xvfbInstance) {
+      this.xvfbInstance.stop();
+      this.xvfbInstance = undefined;
+    }
+    if (this.xvfbCleanup) {
+      process.removeListener('exit', this.xvfbCleanup);
+      process.removeListener('SIGINT', this.xvfbCleanup);
+      process.removeListener('SIGTERM', this.xvfbCleanup);
+      this.xvfbCleanup = undefined;
+    }
+
+    debugDevice('Computer device destroyed');
+  }
+
+  async url(): Promise<string> {
+    return '';
+  }
+}
+
+/**
+ * Platform-specific actions
+ */
+function createPlatformActions() {
+  return {
+    ListDisplays: defineAction({
+      name: 'ListDisplays',
+      description: 'List all available displays/monitors',
+      call: async () => {
+        return await ComputerDevice.listDisplays();
+      },
+    }),
+  } as const;
+}

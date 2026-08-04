@@ -1,0 +1,2102 @@
+import assert from 'node:assert';
+import { execFile } from 'node:child_process';
+import fs, { unlink } from 'node:fs';
+import { createRequire } from 'node:module';
+import path from 'node:path';
+import {
+  type ActionScrollParam,
+  type DeviceAction,
+  type ExecutorContext,
+  type InterfaceType,
+  type LocateResultElement,
+  type Point,
+  type Size,
+  getMidsceneLocationSchema,
+  z,
+} from '@midscene/core';
+import {
+  type AbstractInterface,
+  type AndroidDeviceInputOpt,
+  type AndroidDeviceOpt,
+  type MobileInputPrimitives,
+  type PointerPoint,
+  createDefaultMobileActions,
+  defineAction,
+} from '@midscene/core/device';
+import { getTmpFile, sleep } from '@midscene/core/utils';
+import {
+  MIDSCENE_ADB_PATH,
+  MIDSCENE_ADB_REMOTE_HOST,
+  MIDSCENE_ADB_REMOTE_PORT,
+  MIDSCENE_ANDROID_IME_STRATEGY,
+  globalConfigManager,
+} from '@midscene/shared/env';
+import type { ElementInfo } from '@midscene/shared/extractor';
+import {
+  createImgBase64ByFormat,
+  validateScreenshotBuffer,
+} from '@midscene/shared/img';
+import { getDebug } from '@midscene/shared/logger';
+import { normalizeForComparison, repeat } from '@midscene/shared/utils';
+
+import { ADB } from 'appium-adb';
+import {
+  buildRunAdbShellPlanningFeedback,
+  runAdbShellStdoutOrThrow,
+} from './adb-shell';
+import {
+  type DevicePhysicalInfo,
+  ScrcpyDeviceAdapter,
+} from './scrcpy-device-adapter';
+
+// Re-export AndroidDeviceOpt and AndroidDeviceInputOpt for backward compatibility
+export type {
+  AndroidDeviceOpt,
+  AndroidDeviceInputOpt,
+} from '@midscene/core/device';
+
+// only for Android, because it's impossible to scroll to the bottom, so we need to set a default scroll times
+const defaultScrollUntilTimes = 10;
+const defaultFastScrollDuration = 100;
+const defaultNormalScrollDuration = 1000;
+
+const IME_STRATEGY_ALWAYS_YADB = 'always-yadb' as const;
+const IME_STRATEGY_YADB_FOR_NON_ASCII = 'yadb-for-non-ascii' as const;
+type ScrollDirection = 'up' | 'down' | 'left' | 'right';
+
+const debugDevice = getDebug('android:device');
+const warnDevice = getDebug('android:device', { console: true });
+
+/**
+ * Escape text for safe use in shell single-quoted strings.
+ * In single quotes, all characters are literal except ' itself.
+ * Newlines (0x0A) are converted to literal \n for safe transport;
+ * yadb interprets \n back to a real newline.
+ */
+export function escapeForShell(text: string): string {
+  return text
+    .replace(/'/g, "'\\''") // End quote, escaped quote, start quote: ' → '\''
+    .replace(/\n/g, '\\n'); // 0x0A → literal \n (yadb interprets back to newline)
+}
+
+export class AndroidDevice implements AbstractInterface {
+  private deviceId: string;
+  private yadbPushed = false;
+  private devicePixelRatio = 1;
+  private devicePixelRatioInitialized = false;
+  private adb: ADB | null = null;
+  private connectingAdb: Promise<ADB> | null = null;
+  private destroyed = false;
+  private description: string | undefined;
+  private customActions?: DeviceAction<any>[];
+  private cachedScreenSize: {
+    override: string;
+    physical: string;
+    orientation: number;
+    isCurrentOrientation?: boolean;
+  } | null = null;
+  private cachedOrientation: number | null = null;
+  private cachedPhysicalDisplayId: string | null | undefined = undefined;
+  private scrcpyAdapter: ScrcpyDeviceAdapter | null = null;
+  private appNameMapping: Record<string, string> = {};
+  private cachedAdjustScale: { x: number; y: number } | null = null;
+  private takeScreenshotFailCount = 0;
+  private static readonly TAKE_SCREENSHOT_FAIL_THRESHOLD = 3;
+  private static readonly DEFAULT_MIN_SCREENSHOT_BUFFER_SIZE = 1024;
+  interfaceType: InterfaceType = 'android';
+  uri: string | undefined;
+  options?: AndroidDeviceOpt;
+
+  readonly inputPrimitives: MobileInputPrimitives = {
+    pointer: {
+      tap: (point) => this.tapPoint(point),
+      doubleClick: (point) => this.doubleTapPoint(point),
+      longPress: (point, opts) => this.longPressPoint(point, opts?.duration),
+      dragAndDrop: (from, to) => this.dragPoint(from, to),
+    },
+    keyboard: {
+      keyboardPress: (keyName) => this.pressKey(keyName),
+      typeText: async (value, opts) => {
+        const target = opts?.target as ElementInfo | undefined;
+        if (target && opts?.replace !== false) {
+          await this.clearInput(target);
+        } else if (target) {
+          await this.tapPoint({ x: target.center[0], y: target.center[1] });
+        }
+
+        if (opts?.focusOnly) {
+          return;
+        }
+
+        await this.typeText(value, opts);
+      },
+      clearInput: (target) =>
+        this.clearInput(target as ElementInfo | undefined),
+      cursorMove: async (direction, times = 1) => {
+        const arrowKey = direction === 'left' ? 'ArrowLeft' : 'ArrowRight';
+        for (let i = 0; i < times; i++) {
+          await this.pressKey(arrowKey);
+        }
+      },
+    },
+    touch: {
+      swipe: async (start, end, opts) => {
+        const duration = opts?.duration ?? 300;
+        const repeatCount = opts?.repeat ?? 1;
+        for (let i = 0; i < repeatCount; i++) {
+          await this.dragPoint(start, end, duration);
+        }
+      },
+      pinch: async (center, opts) => {
+        const { x: adjCenterX, y: adjCenterY } = await this.adjustCoordinates(
+          Math.round(center.x),
+          Math.round(center.y),
+        );
+        const ratio =
+          adjCenterX !== 0 && center.x !== 0 ? adjCenterX / center.x : 1;
+        const adjStartDist = Math.round(opts.startDistance * ratio);
+        const adjEndDist = Math.round(opts.endDistance * ratio);
+        await this.ensureYadb();
+        const adb = await this.getAdb();
+        await adb.shell(
+          `app_process${this.getDisplayArg()} -Djava.class.path=/data/local/tmp/yadb /data/local/tmp com.ysbing.yadb.Main -pinch ${adjCenterX} ${adjCenterY} ${adjStartDist} ${adjEndDist} ${opts.duration}`,
+        );
+      },
+    },
+    scroll: {
+      scroll: (param) => this.performActionScroll(param),
+    },
+    system: {
+      backButton: () => this.back(),
+      homeButton: () => this.home(),
+      recentAppsButton: () => this.recentApps(),
+    },
+  };
+
+  actionSpace(): DeviceAction<any>[] {
+    const mobileActionContext = {
+      input: this.inputPrimitives,
+      size: () => this.size(),
+      sleep: async (timeMs: number) => {
+        await sleep(timeMs);
+      },
+      getDefaultAutoDismissKeyboard: () => this.options?.autoDismissKeyboard,
+      systemActions: {
+        backButton: {
+          name: 'AndroidBackButton',
+          description: 'Trigger the system "back" operation on Android devices',
+        },
+        homeButton: {
+          name: 'AndroidHomeButton',
+          description: 'Trigger the system "home" operation on Android devices',
+        },
+        recentAppsButton: {
+          name: 'AndroidRecentAppsButton',
+          description:
+            'Trigger the system "recent apps" operation on Android devices',
+        },
+      },
+    };
+    const defaultActions = [
+      ...createDefaultMobileActions(mobileActionContext),
+      defineAction<
+        z.ZodObject<{
+          direction: z.ZodEnum<['up', 'down']>;
+          distance: z.ZodOptional<z.ZodNumber>;
+          duration: z.ZodOptional<z.ZodNumber>;
+          locate: z.ZodOptional<ReturnType<typeof getMidsceneLocationSchema>>;
+        }>,
+        {
+          direction: 'up' | 'down';
+          distance?: number;
+          duration?: number;
+          locate?: LocateResultElement;
+        }
+      >({
+        name: 'PullGesture',
+        description: 'Trigger pull down to refresh or pull up actions',
+        paramSchema: z.object({
+          direction: z.enum(['up', 'down']).describe('The direction to pull'),
+          distance: z
+            .number()
+            .optional()
+            .describe('The distance to pull (in pixels)'),
+          duration: z
+            .number()
+            .optional()
+            .describe('The duration of the pull (in milliseconds)'),
+          locate: getMidsceneLocationSchema()
+            .optional()
+            .describe('The element to start the pull from (optional)'),
+        }),
+        sample: {
+          direction: 'down',
+          locate: { prompt: 'the center of the content list area' },
+        },
+        call: async (param) => {
+          const element = param.locate;
+          const startPoint = element
+            ? { left: element.center[0], top: element.center[1] }
+            : undefined;
+          if (!param || !param.direction) {
+            throw new Error('PullGesture requires a direction parameter');
+          }
+          if (param.direction === 'down') {
+            await this.pullDown(startPoint, param.distance, param.duration);
+          } else if (param.direction === 'up') {
+            await this.pullUp(startPoint, param.distance, param.duration);
+          } else {
+            throw new Error(`Unknown pull direction: ${param.direction}`);
+          }
+        },
+      }),
+    ];
+
+    const platformSpecificActions = Object.values(createPlatformActions(this));
+
+    const customActions = this.customActions || [];
+    return [...defaultActions, ...platformSpecificActions, ...customActions];
+  }
+
+  private async performActionScroll(param: ActionScrollParam): Promise<void> {
+    const element = param.locate;
+    const startingPoint = element
+      ? {
+          left: element.center[0],
+          top: element.center[1],
+        }
+      : undefined;
+    const scrollToEventName = param?.scrollType;
+    if (scrollToEventName === 'scrollToTop') {
+      await this.scrollUntilTop(startingPoint);
+    } else if (scrollToEventName === 'scrollToBottom') {
+      await this.scrollUntilBottom(startingPoint);
+    } else if (scrollToEventName === 'scrollToRight') {
+      await this.scrollUntilRight(startingPoint);
+    } else if (scrollToEventName === 'scrollToLeft') {
+      await this.scrollUntilLeft(startingPoint);
+    } else if (scrollToEventName === 'singleAction' || !scrollToEventName) {
+      if (param?.direction === 'down' || !param || !param.direction) {
+        await this.scrollDown(param?.distance || undefined, startingPoint);
+      } else if (param.direction === 'up') {
+        await this.scrollUp(param.distance || undefined, startingPoint);
+      } else if (param.direction === 'left') {
+        await this.scrollLeft(param.distance || undefined, startingPoint);
+      } else if (param.direction === 'right') {
+        await this.scrollRight(param.distance || undefined, startingPoint);
+      } else {
+        throw new Error(`Unknown scroll direction: ${param.direction}`);
+      }
+      await sleep(500);
+    } else {
+      throw new Error(
+        `Unknown scroll event type: ${scrollToEventName}, param: ${JSON.stringify(
+          param,
+        )}`,
+      );
+    }
+  }
+
+  constructor(deviceId: string, options?: AndroidDeviceOpt) {
+    assert(deviceId, 'deviceId is required for AndroidDevice');
+
+    this.deviceId = deviceId;
+    this.options = options;
+    this.customActions = options?.customActions;
+  }
+
+  describe(): string {
+    return this.description || `DeviceId: ${this.deviceId}`;
+  }
+
+  public async connect(): Promise<ADB> {
+    const adb = await this.getAdb();
+
+    // Initialize scrcpy connection (if enabled)
+    // If it fails, scrcpy is permanently disabled and ADB fallback is used
+    const adapter = this.getScrcpyAdapter();
+    if (adapter.isEnabled()) {
+      try {
+        const deviceInfo = await this.getDevicePhysicalInfo();
+        await adapter.initialize(deviceInfo);
+        console.log(
+          `[midscene] Using scrcpy for screenshots (device: ${this.deviceId})`,
+        );
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        warnDevice(
+          `[midscene] Scrcpy unavailable, using ADB fallback (device: ${this.deviceId}): ${msg}`,
+        );
+      }
+    }
+
+    return adb;
+  }
+
+  public async getAdb(): Promise<ADB> {
+    if (this.destroyed) {
+      throw new Error(
+        `AndroidDevice ${this.deviceId} has been destroyed and cannot execute ADB commands`,
+      );
+    }
+
+    // if already has ADB instance, return it
+    if (this.adb) {
+      return this.createAdbProxy(this.adb);
+    }
+
+    // If already connecting, wait for connection to complete
+    if (this.connectingAdb) {
+      return this.connectingAdb.then((adb) => this.createAdbProxy(adb));
+    }
+
+    // Create new connection Promise
+    this.connectingAdb = (async () => {
+      let error: Error | null = null;
+      debugDevice(`Initializing ADB with device ID: ${this.deviceId}`);
+      try {
+        const androidAdbPath =
+          this.options?.androidAdbPath ||
+          globalConfigManager.getEnvConfigValue(MIDSCENE_ADB_PATH);
+        const remoteAdbHost =
+          this.options?.remoteAdbHost ||
+          globalConfigManager.getEnvConfigValue(MIDSCENE_ADB_REMOTE_HOST);
+        const remoteAdbPort =
+          this.options?.remoteAdbPort ||
+          globalConfigManager.getEnvConfigValue(MIDSCENE_ADB_REMOTE_PORT);
+
+        this.adb = new ADB({
+          udid: this.deviceId,
+          adbExecTimeout: 60000,
+          executable: androidAdbPath
+            ? { path: androidAdbPath, defaultArgs: [] }
+            : undefined,
+          remoteAdbHost: remoteAdbHost || undefined,
+          remoteAdbPort: remoteAdbPort ? Number(remoteAdbPort) : undefined,
+        });
+
+        const size = await this.getScreenSize();
+        this.description = `
+DeviceId: ${this.deviceId}
+ScreenSize:
+${Object.keys(size)
+  .filter((key) => size[key as keyof typeof size])
+  .map(
+    (key) =>
+      `  ${key} size: ${size[key as keyof typeof size]}${key === 'override' && size[key as keyof typeof size] ? ' ✅' : ''}`,
+  )
+  .join('\n')}
+`;
+        debugDevice('ADB initialized successfully', this.description);
+        return this.adb;
+      } catch (e) {
+        debugDevice(`Failed to initialize ADB: ${e}`);
+        error = new Error(`Unable to connect to device ${this.deviceId}: ${e}`);
+      } finally {
+        this.connectingAdb = null;
+      }
+
+      if (error) {
+        throw error;
+      }
+
+      throw new Error('ADB initialization failed unexpectedly');
+    })();
+
+    return this.connectingAdb;
+  }
+
+  private createAdbProxy(adb: ADB): ADB {
+    // create ADB proxy object, intercept all method calls
+    return new Proxy(adb, {
+      get: (target, prop) => {
+        const originalMethod = target[prop as keyof typeof target];
+
+        // if the property is not a function, return the original value
+        if (typeof originalMethod !== 'function') {
+          return originalMethod;
+        }
+
+        // return the proxied method
+        return async (...args: any[]) => {
+          try {
+            debugDevice(`adb ${String(prop)} ${args.join(' ')}`);
+            const result = await (
+              originalMethod as (...args: any[]) => any
+            ).apply(target, args);
+            debugDevice(`adb ${String(prop)} ${args.join(' ')} end`);
+            return result;
+          } catch (error: any) {
+            const methodName = String(prop);
+            const deviceId = this.deviceId;
+            debugDevice(
+              `ADB error with device ${deviceId} when calling ${methodName}: ${error}`,
+            );
+
+            // throw the error again
+            throw new Error(
+              `ADB error with device ${deviceId} when calling ${methodName}, please check https://midscenejs.com/integrate-with-android.html#faq : ${error.message}`,
+              {
+                cause: error,
+              },
+            );
+          }
+        };
+      },
+    });
+  }
+
+  /**
+   * Get or create the scrcpy adapter (lazy initialization)
+   */
+  private getScrcpyAdapter(): ScrcpyDeviceAdapter {
+    if (!this.scrcpyAdapter) {
+      this.scrcpyAdapter = new ScrcpyDeviceAdapter(
+        this.deviceId,
+        this.options?.scrcpyConfig,
+      );
+    }
+    return this.scrcpyAdapter;
+  }
+
+  /**
+   * Get device physical info needed by scrcpy adapter
+   */
+  private async getDevicePhysicalInfo(): Promise<DevicePhysicalInfo> {
+    await this.initializeDevicePixelRatio();
+    const screenSize = await this.getScreenSize();
+    const sizeStr = screenSize.override || screenSize.physical;
+    const match = sizeStr.match(/(\d{1,5})x(\d{1,5})/);
+    if (!match) {
+      throw new Error(`Unable to parse screen size: ${sizeStr}`);
+    }
+    return {
+      physicalWidth: Number.parseInt(match[1], 10),
+      physicalHeight: Number.parseInt(match[2], 10),
+      dpr: this.devicePixelRatio,
+      orientation: screenSize.orientation,
+      isCurrentOrientation: screenSize.isCurrentOrientation,
+    };
+  }
+
+  /**
+   * Set the app name to package name mapping
+   */
+  public setAppNameMapping(mapping: Record<string, string>): void {
+    this.appNameMapping = mapping;
+  }
+
+  /**
+   * Resolve app name to package name using the mapping
+   * Comparison is case-insensitive and ignores spaces, dashes, and underscores.
+   * Keys in appNameMapping are pre-normalized, so we only need to normalize the input.
+   * @param appName The app name to resolve
+   */
+  private resolvePackageName(appName: string): string | undefined {
+    const normalizedAppName = normalizeForComparison(appName);
+    return this.appNameMapping[normalizedAppName];
+  }
+
+  public async launch(uri: string): Promise<AndroidDevice> {
+    const adb = await this.getAdb();
+
+    this.uri = uri;
+
+    try {
+      debugDevice(`Launching app: ${uri}`);
+      if (
+        uri.startsWith('http://') ||
+        uri.startsWith('https://') ||
+        uri.includes('://')
+      ) {
+        // If it's a URI with scheme
+        await adb.startUri(uri);
+      } else if (uri.includes('/')) {
+        // If it's in format like 'com.android/settings.Settings'
+        const [appPackage, appActivity] = uri.split('/');
+        await adb.startApp({
+          pkg: appPackage,
+          activity: appActivity,
+        });
+      } else {
+        // Assume it's just a package name or app name
+        // Auto-resolve friendly app name to package name if mapping exists
+        const resolvedUri = this.resolvePackageName(uri) ?? uri;
+        await adb.activateApp(resolvedUri);
+      }
+      debugDevice(`Successfully launched: ${uri}`);
+    } catch (error: any) {
+      debugDevice(`Error launching ${uri}: ${error}`);
+      throw new Error(`Failed to launch ${uri}: ${error.message}`, {
+        cause: error,
+      });
+    }
+
+    return this;
+  }
+
+  /**
+   * Terminate (force-stop) an Android app by package name.
+   * Supports app name resolution via setAppNameMapping.
+   * If uri contains "/" (e.g. com.example.app/.MainActivity), only the package part is used.
+   */
+  public async terminate(uri: string): Promise<void> {
+    const packagePart = uri.includes('/') ? uri.split('/')[0] : uri;
+    const resolved = this.resolvePackageName(packagePart) ?? packagePart;
+    const adb = await this.getAdb();
+    try {
+      debugDevice(`Terminating app: ${resolved}`);
+      await adb.shell(`am force-stop ${resolved}`);
+      debugDevice(`Successfully terminated: ${resolved}`);
+    } catch (error: any) {
+      debugDevice(`Error terminating ${resolved}: ${error}`);
+      throw new Error(`Failed to terminate ${resolved}: ${error.message}`, {
+        cause: error,
+      });
+    }
+  }
+
+  async execYadb(keyboardContent: string): Promise<void> {
+    await this.ensureYadb();
+
+    const adb = await this.getAdb();
+
+    await adb.shell(
+      `app_process${this.getDisplayArg()} -Djava.class.path=/data/local/tmp/yadb /data/local/tmp com.ysbing.yadb.Main -keyboard '${keyboardContent}'`,
+    );
+  }
+
+  // @deprecated
+  async getElementsInfo(): Promise<ElementInfo[]> {
+    return [];
+  }
+
+  async getElementsNodeTree(): Promise<any> {
+    // Simplified implementation, returns an empty node tree
+    return {
+      node: null,
+      children: [],
+    };
+  }
+
+  async getScreenSize(): Promise<{
+    override: string;
+    physical: string;
+    orientation: number; // 0=portrait, 1=landscape, 2=reverse portrait, 3=reverse landscape
+    isCurrentOrientation?: boolean; // true if dimensions are in current orientation, false if in native orientation
+  }> {
+    // Return cached value if not always fetching and cache exists
+    const shouldCache = !(this.options?.alwaysRefreshScreenInfo ?? false);
+    debugDevice(
+      `getScreenSize: alwaysRefreshScreenInfo=${this.options?.alwaysRefreshScreenInfo}, shouldCache=${shouldCache}, hasCachedSize=${!!this.cachedScreenSize}`,
+    );
+    if (shouldCache && this.cachedScreenSize) {
+      return this.cachedScreenSize;
+    }
+
+    const adb = await this.getAdb();
+
+    // If we have an displayId, try to get size from display info
+    if (typeof this.options?.displayId === 'number') {
+      try {
+        const stdout = await adb.shell('dumpsys display');
+
+        if (this.options?.usePhysicalDisplayIdForDisplayLookup) {
+          const physicalDisplayId = await this.getPhysicalDisplayId();
+          if (physicalDisplayId) {
+            // Use regex to find the line containing the target display's uniqueId
+            const lineRegex = new RegExp(
+              `^.*uniqueId \"local:${physicalDisplayId}\".*$
+`,
+              'm',
+            );
+            const lineMatch = stdout.match(lineRegex);
+
+            if (lineMatch) {
+              const targetLine = lineMatch[0];
+              // Extract real size and rotation from the found line
+              const realMatch = targetLine.match(/real (\d+) x (\d+)/);
+              const rotationMatch = targetLine.match(/rotation (\d+)/);
+
+              if (realMatch && rotationMatch) {
+                const width = Number(realMatch[1]);
+                const height = Number(realMatch[2]);
+                const rotation = Number(rotationMatch[1]);
+                const sizeStr = `${width}x${height}`;
+
+                debugDevice(
+                  `Using display info for long ID ${physicalDisplayId}: ${sizeStr}, rotation: ${rotation}`,
+                );
+
+                const result = {
+                  override: sizeStr,
+                  physical: sizeStr,
+                  orientation: rotation,
+                  isCurrentOrientation: true, // "real" size from dumpsys display is in current orientation
+                };
+
+                // Cache the result if caching is enabled
+                if (shouldCache) {
+                  this.cachedScreenSize = result;
+                }
+
+                return result;
+              }
+            }
+          }
+        } else {
+          // Use regex to find the DisplayViewport containing the target display's displayId
+          const viewportRegex = new RegExp(
+            `DisplayViewport{[^}]*displayId=${this.options.displayId}[^}]*}`,
+            'g',
+          );
+          const match = stdout.match(viewportRegex);
+          if (match) {
+            const targetLine = match[0];
+            const physicalFrameMatch = targetLine.match(
+              /physicalFrame=Rect\(\d+, \d+ - (\d+), (\d+)\)/,
+            );
+            const orientationMatch = targetLine.match(/orientation=(\d+)/);
+            if (physicalFrameMatch && orientationMatch) {
+              const width = Number(physicalFrameMatch[1]);
+              const height = Number(physicalFrameMatch[2]);
+              const rotation = Number(orientationMatch[1]);
+              const sizeStr = `${width}x${height}`;
+
+              debugDevice(
+                `Using display info for display ID ${this.options.displayId}: ${sizeStr}, rotation: ${rotation}`,
+              );
+
+              const result = {
+                override: sizeStr,
+                physical: sizeStr,
+                orientation: rotation,
+                isCurrentOrientation: true, // size from DisplayViewport is in current orientation
+              };
+
+              // Cache the result if caching is enabled
+              if (shouldCache) {
+                this.cachedScreenSize = result;
+              }
+
+              return result;
+            }
+          }
+        }
+
+        debugDevice(
+          `Could not find display info for displayId ${this.options.displayId}`,
+        );
+      } catch (e) {
+        debugDevice(
+          `Failed to get size from display info for display ${this.options.displayId}: ${e}`,
+        );
+      }
+    }
+
+    // Fallback to wm size (global screen size)
+    const stdout = await adb.shell(['wm', 'size']);
+    const size = {
+      override: '',
+      physical: '',
+    };
+
+    // First try to get Override size
+    const overrideSize = new RegExp(/Override size: ([^\r?\n]+)*/g).exec(
+      stdout,
+    );
+    if (overrideSize && overrideSize.length >= 2 && overrideSize[1]) {
+      debugDevice(`Using Override size: ${overrideSize[1].trim()}`);
+      size.override = overrideSize[1].trim();
+    }
+
+    // If Override size doesn't exist, fallback to Physical size
+    const physicalSize = new RegExp(/Physical size: ([^\r?\n]+)*/g).exec(
+      stdout,
+    );
+    if (physicalSize && physicalSize.length >= 2) {
+      debugDevice(`Using Physical size: ${physicalSize[1].trim()}`);
+      size.physical = physicalSize[1].trim();
+    }
+
+    const orientation = await this.getDisplayOrientation();
+
+    if (size.override || size.physical) {
+      const result = { ...size, orientation, isCurrentOrientation: false }; // wm size is in native orientation
+
+      // Cache the result if caching is enabled
+      if (shouldCache) {
+        this.cachedScreenSize = result;
+      }
+
+      return result;
+    }
+
+    throw new Error(`Failed to get screen size, output: ${stdout}`);
+  }
+
+  private async initializeDevicePixelRatio(): Promise<void> {
+    if (this.devicePixelRatioInitialized) {
+      return;
+    }
+
+    // Get device display density using custom method
+    const densityNum = await this.getDisplayDensity();
+    // Standard density is 160, calculate the ratio
+    this.devicePixelRatio = Number(densityNum) / 160;
+    debugDevice(`Initialized device pixel ratio: ${this.devicePixelRatio}`);
+
+    this.devicePixelRatioInitialized = true;
+  }
+
+  async getDisplayDensity(): Promise<number> {
+    const adb = await this.getAdb();
+
+    // If we have an displayId, try to get density from display info
+    if (typeof this.options?.displayId === 'number') {
+      try {
+        const stdout = await adb.shell('dumpsys display');
+        if (this.options?.usePhysicalDisplayIdForDisplayLookup) {
+          const physicalDisplayId = await this.getPhysicalDisplayId();
+          if (physicalDisplayId) {
+            // Use regex to find the line containing the target display's uniqueId
+            const lineRegex = new RegExp(
+              `^.*uniqueId \"local:${physicalDisplayId}\".*$
+`,
+              'm',
+            );
+            const lineMatch = stdout.match(lineRegex);
+
+            if (lineMatch) {
+              const targetLine = lineMatch[0];
+              const densityMatch = targetLine.match(/density (\d+)/);
+              if (densityMatch) {
+                const density = Number(densityMatch[1]);
+                debugDevice(
+                  `Using display density for physical ID ${physicalDisplayId}: ${density}`,
+                );
+                return density;
+              }
+            }
+          }
+        } else {
+          const displayDeviceRegex = new RegExp(
+            `DisplayDevice:[\\s\\S]*?mDisplayId=${this.options.displayId}[\\s\\S]*?DisplayInfo{[^}]*density (\\d+)`,
+            'm',
+          );
+          const deviceBlockMatch = stdout.match(displayDeviceRegex);
+          if (deviceBlockMatch) {
+            const density = Number(deviceBlockMatch[1]);
+            debugDevice(
+              `Using display density for display ID ${this.options.displayId}: ${density}`,
+            );
+            return density;
+          }
+        }
+      } catch (e) {
+        debugDevice(`Failed to get density from display info: ${e}`);
+      }
+    }
+
+    // Fallback to global screen density
+    const density = await adb.getScreenDensity();
+    return density ?? 160; // Default to standard Android density if null
+  }
+
+  async getDisplayOrientation(): Promise<number> {
+    // Return cached value if not always fetching and cache exists
+    const shouldCache = !(this.options?.alwaysRefreshScreenInfo ?? false);
+    debugDevice(
+      `getDisplayOrientation: alwaysRefreshScreenInfo=${this.options?.alwaysRefreshScreenInfo}, shouldCache=${shouldCache}, hasCachedOrientation=${this.cachedOrientation !== null}`,
+    );
+    if (shouldCache && this.cachedOrientation !== null) {
+      return this.cachedOrientation;
+    }
+
+    const adb = await this.getAdb();
+    let orientation = 0;
+
+    try {
+      const orientationStdout = await adb.shell(
+        `dumpsys${this.getDisplayArg()} input | grep SurfaceOrientation`,
+      );
+      const orientationMatch = orientationStdout.match(
+        /SurfaceOrientation:\s*(\d)/,
+      );
+      if (!orientationMatch) {
+        throw new Error('Failed to get orientation from input');
+      }
+
+      orientation = Number(orientationMatch[1]);
+      debugDevice(`Screen orientation: ${orientation}`);
+    } catch (e) {
+      debugDevice('Failed to get orientation from input, try display');
+      try {
+        const orientationStdout = await adb.shell(
+          `dumpsys${this.getDisplayArg()} display | grep mCurrentOrientation`,
+        );
+        const orientationMatch = orientationStdout.match(
+          /mCurrentOrientation=(\d)/,
+        );
+        if (!orientationMatch) {
+          throw new Error('Failed to get orientation from display');
+        }
+
+        orientation = Number(orientationMatch[1]);
+        debugDevice(`Screen orientation (fallback): ${orientation}`);
+      } catch (e2) {
+        orientation = 0;
+        debugDevice('Failed to get orientation from display, default to 0');
+      }
+    }
+
+    // Cache the result if caching is enabled
+    if (shouldCache) {
+      this.cachedOrientation = orientation;
+    }
+
+    return orientation;
+  }
+
+  /**
+   * Get physical screen dimensions adjusted for current orientation.
+   * Swaps width/height when the device is in landscape and the reported
+   * dimensions do not already reflect the current orientation.
+   */
+  private async getOrientedPhysicalSize(): Promise<{
+    width: number;
+    height: number;
+  }> {
+    const info = await this.getDevicePhysicalInfo();
+    const isLandscape = info.orientation === 1 || info.orientation === 3;
+    const shouldSwap = info.isCurrentOrientation !== true && isLandscape;
+    return {
+      width: shouldSwap ? info.physicalHeight : info.physicalWidth,
+      height: shouldSwap ? info.physicalWidth : info.physicalHeight,
+    };
+  }
+
+  async size(): Promise<Size> {
+    const physical = await this.getOrientedPhysicalSize();
+    const scale = 1 / this.devicePixelRatio;
+
+    return {
+      width: Math.round(physical.width * scale),
+      height: Math.round(physical.height * scale),
+    };
+  }
+
+  /**
+   * Compute and cache the coordinate adjustment scale by comparing
+   * physical dimensions with logical dimensions from size().
+   * Cached after first call; invalidated on destroy().
+   */
+  private async getAdjustScale(): Promise<{ x: number; y: number }> {
+    const shouldCache = !(this.options?.alwaysRefreshScreenInfo ?? false);
+    debugDevice(
+      `getAdjustScale: alwaysRefreshScreenInfo=${this.options?.alwaysRefreshScreenInfo}, shouldCache=${shouldCache}, hasCachedScale=${!!this.cachedAdjustScale}`,
+    );
+    if (shouldCache && this.cachedAdjustScale) {
+      return this.cachedAdjustScale;
+    }
+
+    const physical = await this.getOrientedPhysicalSize();
+    const { width: logicalW, height: logicalH } = await this.size();
+    const scale = {
+      x: logicalW / physical.width,
+      y: logicalH / physical.height,
+    };
+
+    if (shouldCache) {
+      this.cachedAdjustScale = scale;
+    }
+    return scale;
+  }
+
+  /**
+   * Convert logical coordinates (from AI) back to physical coordinates (for ADB).
+   * The ratio is derived from size(), so overriding size() alone is sufficient.
+   */
+  private async adjustCoordinates(
+    x: number,
+    y: number,
+  ): Promise<{ x: number; y: number }> {
+    const scale = await this.getAdjustScale();
+    return {
+      x: Math.round(x / scale.x),
+      y: Math.round(y / scale.y),
+    };
+  }
+
+  /**
+   * Calculate the end point for scroll operations based on start point, scroll delta, and screen boundaries.
+   * This method ensures that scroll operations stay within screen bounds and maintain a minimum scroll distance
+   * for effective scrolling gestures on Android devices.
+   *
+   * @param start - The starting point of the scroll gesture
+   * @param deltaX - The horizontal scroll distance (positive = scroll right, negative = scroll left)
+   * @param deltaY - The vertical scroll distance (positive = scroll down, negative = scroll up)
+   * @param maxWidth - The maximum width boundary (screen width)
+   * @param maxHeight - The maximum height boundary (screen height)
+   * @returns The calculated end point for the scroll gesture
+   */
+  private calculateScrollEndPoint(
+    start: { x: number; y: number },
+    deltaX: number,
+    deltaY: number,
+    maxWidth: number,
+    maxHeight: number,
+  ): { x: number; y: number } {
+    // Minimum scroll distance to ensure gesture is recognized by Android
+    const minScrollDistance = 50;
+
+    let actualScrollDistanceX = 0;
+    let actualScrollDistanceY = 0;
+
+    // Calculate horizontal scroll distance
+    if (deltaX !== 0) {
+      // Determine maximum available distance in the scroll direction
+      const maxAvailableX = deltaX > 0 ? maxWidth - start.x : start.x;
+      // Limit scroll distance to available space
+      actualScrollDistanceX = Math.min(Math.abs(deltaX), maxAvailableX);
+      // Ensure minimum scroll distance for gesture recognition
+      const minScrollX = Math.min(minScrollDistance, actualScrollDistanceX);
+      actualScrollDistanceX = Math.max(minScrollX, actualScrollDistanceX);
+    }
+
+    // Calculate vertical scroll distance
+    if (deltaY !== 0) {
+      // Determine maximum available distance in the scroll direction
+      const maxAvailableY = deltaY > 0 ? maxHeight - start.y : start.y;
+      // Limit scroll distance to available space
+      actualScrollDistanceY = Math.min(Math.abs(deltaY), maxAvailableY);
+      // Ensure minimum scroll distance for gesture recognition
+      const minScrollY = Math.min(minScrollDistance, actualScrollDistanceY);
+      actualScrollDistanceY = Math.max(minScrollY, actualScrollDistanceY);
+    }
+
+    // Calculate final end coordinates, ensuring they stay within screen bounds
+    const endX = Math.round(
+      deltaX === 0
+        ? start.x // No horizontal movement
+        : deltaX > 0
+          ? Math.min(maxWidth, start.x + actualScrollDistanceX) // Scroll right, cap at maxWidth
+          : Math.max(0, start.x - actualScrollDistanceX), // Scroll left, cap at 0
+    );
+
+    const endY = Math.round(
+      deltaY === 0
+        ? start.y // No vertical movement
+        : deltaY > 0
+          ? Math.min(maxHeight, start.y + actualScrollDistanceY) // Scroll down, cap at maxHeight
+          : Math.max(0, start.y - actualScrollDistanceY), // Scroll up, cap at 0
+    );
+
+    return { x: endX, y: endY };
+  }
+
+  private warnScrollDistanceClamped(
+    direction: ScrollDirection,
+    requestedDistance: number,
+    appliedDistance: number,
+  ): void {
+    if (requestedDistance <= appliedDistance) {
+      return;
+    }
+
+    const scrollToSuggestion: Record<ScrollDirection, string> = {
+      down: 'scrollToBottom',
+      up: 'scrollToTop',
+      left: 'scrollToLeft',
+      right: 'scrollToRight',
+    };
+    const edgeLabel: Record<ScrollDirection, string> = {
+      down: 'bottom',
+      up: 'top',
+      left: 'left edge',
+      right: 'right edge',
+    };
+
+    warnDevice(
+      `[midscene] Android ADB swipe coordinates must stay within the screen bounds. The requested scroll distance (${requestedDistance}px) exceeds the maximum single swipe distance (${appliedDistance}px) from the current start point, so it will be clamped. If you want to scroll to the ${edgeLabel[direction]}, use ${scrollToSuggestion[direction]} instead.`,
+    );
+  }
+
+  async screenshotBase64(): Promise<string> {
+    debugDevice('screenshotBase64 begin');
+
+    // Try scrcpy mode first (if enabled and initialized)
+    const adapter = this.getScrcpyAdapter();
+    if (adapter.isEnabled()) {
+      try {
+        debugDevice('Attempting scrcpy screenshot...');
+        const deviceInfo = await this.getDevicePhysicalInfo();
+        const result = await adapter.screenshotBase64(deviceInfo);
+        debugDevice('screenshotBase64 end (scrcpy mode)');
+        return result;
+      } catch (error) {
+        debugDevice(
+          `Scrcpy screenshot failed, falling back to standard ADB method.\nError: ${error}`,
+        );
+        // Continue to standard ADB path
+      }
+    }
+
+    // Standard ADB screenshot path
+    const adb = await this.getAdb();
+    let screenshotBuffer: Buffer | undefined;
+    let localScreenshotPath: string | null = null;
+    const screenshotId = Date.now().toString(36);
+    const androidScreenshotPath = `/data/local/tmp/ms_${screenshotId}.png`;
+    const useShellScreencap = typeof this.options?.displayId === 'number';
+
+    try {
+      // Skip takeScreenshot if it has failed consecutively, go directly to shell screencap
+      if (
+        !useShellScreencap &&
+        this.takeScreenshotFailCount <
+          AndroidDevice.TAKE_SCREENSHOT_FAIL_THRESHOLD
+      ) {
+        debugDevice('Taking screenshot via adb.takeScreenshot');
+        screenshotBuffer = await (
+          adb.takeScreenshot as unknown as () => Promise<Buffer>
+        ).call(adb);
+        debugDevice('adb.takeScreenshot completed');
+
+        try {
+          validateScreenshotBuffer(screenshotBuffer, {
+            label: 'Screenshot',
+            minBufferSize:
+              this.options?.minScreenshotBufferSize ??
+              AndroidDevice.DEFAULT_MIN_SCREENSHOT_BUFFER_SIZE,
+          });
+        } catch (validationError) {
+          debugDevice(
+            'Invalid screenshot buffer detected: %s',
+            validationError instanceof Error
+              ? validationError.message
+              : String(validationError),
+          );
+          this.takeScreenshotFailCount++;
+          throw validationError;
+        }
+
+        // Reset fail count on success
+        this.takeScreenshotFailCount = 0;
+      } else {
+        if (
+          this.takeScreenshotFailCount >=
+          AndroidDevice.TAKE_SCREENSHOT_FAIL_THRESHOLD
+        ) {
+          debugDevice(
+            'Skipping takeScreenshot (failed %d consecutive times), using shell screencap directly',
+            this.takeScreenshotFailCount,
+          );
+        }
+        throw new Error('Using shell screencap directly');
+      }
+    } catch (error) {
+      debugDevice(
+        `Taking screenshot via adb.takeScreenshot failed or was skipped: ${error}`,
+      );
+      const screenshotPath = getTmpFile('png')!;
+      localScreenshotPath = screenshotPath;
+
+      try {
+        debugDevice('Fallback: taking screenshot via shell screencap');
+        const displayId = this.options?.usePhysicalDisplayIdForScreenshot
+          ? await this.getPhysicalDisplayId()
+          : this.options?.displayId;
+        const displayArg = displayId ? `-d ${displayId}` : '';
+        try {
+          // Take a screenshot and save it locally
+          await adb.shell(
+            `screencap -p ${displayArg} ${androidScreenshotPath}`.trim(),
+          );
+          debugDevice('adb.shell screencap completed');
+        } catch (screencapError) {
+          debugDevice('screencap failed, using forceScreenshot');
+          await this.forceScreenshot(androidScreenshotPath);
+          debugDevice('forceScreenshot completed');
+        }
+
+        debugDevice('Pulling screenshot file from device');
+        await adb.pull(androidScreenshotPath, screenshotPath);
+        debugDevice(`adb.pull completed, local path: ${screenshotPath}`);
+        screenshotBuffer = await fs.promises.readFile(screenshotPath);
+
+        validateScreenshotBuffer(screenshotBuffer, {
+          label: 'Fallback screenshot',
+          minBufferSize:
+            this.options?.minScreenshotBufferSize ??
+            AndroidDevice.DEFAULT_MIN_SCREENSHOT_BUFFER_SIZE,
+        });
+
+        debugDevice(
+          `Fallback screenshot validated successfully: ${screenshotBuffer.length} bytes`,
+        );
+      } finally {
+        // Fire-and-forget: delete remote screenshot via separate process
+        // Using execFile instead of adb.shell to avoid blocking the main ADB connection
+        // (adb.shell has a 60s timeout that can block all subsequent ADB operations)
+        const adbPath = adb.executable?.path ?? 'adb';
+        const child = execFile(
+          adbPath,
+          ['-s', this.deviceId, 'shell', `rm ${androidScreenshotPath}`],
+          { timeout: 3000 },
+          (err) => {
+            if (err)
+              debugDevice(
+                'Failed to delete remote screenshot: %s',
+                err.message,
+              );
+          },
+        );
+        child.unref();
+      }
+    }
+
+    if (!screenshotBuffer) {
+      throw new Error('Failed to capture screenshot: all methods failed');
+    }
+
+    debugDevice('Converting to base64');
+    const result = createImgBase64ByFormat(
+      'png',
+      screenshotBuffer.toString('base64'),
+    );
+    if (localScreenshotPath) {
+      debugDevice(`Deleting local screenshot: ${localScreenshotPath}`);
+      unlink(localScreenshotPath, (unlinkError) => {
+        if (unlinkError) {
+          debugDevice(`Failed to delete screenshot: ${unlinkError}`);
+        }
+      });
+    }
+    debugDevice('screenshotBase64 end');
+    return result;
+  }
+
+  async clearInput(element?: ElementInfo): Promise<void> {
+    if (element) {
+      await this.tapPoint({ x: element.center[0], y: element.center[1] });
+    }
+
+    await this.ensureYadb();
+    const adb = await this.getAdb();
+
+    const IME_STRATEGY =
+      (this.options?.imeStrategy ||
+        globalConfigManager.getEnvConfigValue(MIDSCENE_ANDROID_IME_STRATEGY)) ??
+      IME_STRATEGY_YADB_FOR_NON_ASCII;
+
+    if (IME_STRATEGY === IME_STRATEGY_YADB_FOR_NON_ASCII) {
+      // For yadb-for-non-ascii mode, use batch deletion of up to 100 characters
+      // clearTextField() batches all key events into a single shell command for better performance
+      await adb.clearTextField(100);
+    } else {
+      // Use the yadb tool to clear the input box
+      await adb.shell(
+        `app_process${this.getDisplayArg()} -Djava.class.path=/data/local/tmp/yadb /data/local/tmp com.ysbing.yadb.Main -keyboardClear`,
+      );
+    }
+
+    if (await adb.isSoftKeyboardPresent()) {
+      return;
+    }
+
+    if (element) {
+      await this.tapPoint({ x: element.center[0], y: element.center[1] });
+    }
+  }
+
+  async forceScreenshot(path: string): Promise<void> {
+    // screenshot which is forbidden by app
+    await this.ensureYadb();
+
+    const adb = await this.getAdb();
+
+    await adb.shell(
+      `app_process -Djava.class.path=/data/local/tmp/yadb /data/local/tmp com.ysbing.yadb.Main -screenshot ${path}`,
+    );
+  }
+
+  async url(): Promise<string> {
+    return '';
+  }
+
+  async scrollUntilTop(startPoint?: Point): Promise<void> {
+    if (startPoint) {
+      const { height } = await this.size();
+      const start = {
+        x: Math.round(startPoint.left),
+        y: Math.round(startPoint.top),
+      };
+      const end = { x: start.x, y: Math.round(height) };
+
+      await repeat(defaultScrollUntilTimes, () =>
+        this.dragPoint(start, end, defaultFastScrollDuration),
+      );
+      await sleep(1000);
+      return;
+    }
+
+    await repeat(defaultScrollUntilTimes, () =>
+      this.scroll(0, -9999999, defaultFastScrollDuration),
+    );
+    await sleep(1000);
+  }
+
+  async scrollUntilBottom(startPoint?: Point): Promise<void> {
+    if (startPoint) {
+      const start = {
+        x: Math.round(startPoint.left),
+        y: Math.round(startPoint.top),
+      };
+      const end = { x: start.x, y: 0 };
+
+      await repeat(defaultScrollUntilTimes, () =>
+        this.dragPoint(start, end, defaultFastScrollDuration),
+      );
+      await sleep(1000);
+      return;
+    }
+
+    await repeat(defaultScrollUntilTimes, () =>
+      this.scroll(0, 9999999, defaultFastScrollDuration),
+    );
+    await sleep(1000);
+  }
+
+  async scrollUntilLeft(startPoint?: Point): Promise<void> {
+    if (startPoint) {
+      const { width } = await this.size();
+      const start = {
+        x: Math.round(startPoint.left),
+        y: Math.round(startPoint.top),
+      };
+      const end = { x: Math.round(width), y: start.y };
+
+      await repeat(defaultScrollUntilTimes, () =>
+        this.dragPoint(start, end, defaultFastScrollDuration),
+      );
+      await sleep(1000);
+      return;
+    }
+
+    await repeat(defaultScrollUntilTimes, () =>
+      this.scroll(-9999999, 0, defaultFastScrollDuration),
+    );
+    await sleep(1000);
+  }
+
+  async scrollUntilRight(startPoint?: Point): Promise<void> {
+    if (startPoint) {
+      const start = {
+        x: Math.round(startPoint.left),
+        y: Math.round(startPoint.top),
+      };
+      const end = { x: 0, y: start.y };
+
+      await repeat(defaultScrollUntilTimes, () =>
+        this.dragPoint(start, end, defaultFastScrollDuration),
+      );
+      await sleep(1000);
+      return;
+    }
+
+    await repeat(defaultScrollUntilTimes, () =>
+      this.scroll(9999999, 0, defaultFastScrollDuration),
+    );
+    await sleep(1000);
+  }
+
+  async scrollUp(distance?: number, startPoint?: Point): Promise<void> {
+    const { height } = await this.size();
+    const scrollDistance = Math.round(distance || height);
+    const hasExplicitDistance = distance !== undefined;
+
+    if (startPoint) {
+      const start = {
+        x: Math.round(startPoint.left),
+        y: Math.round(startPoint.top),
+      };
+      const end = this.calculateScrollEndPoint(
+        start,
+        0,
+        scrollDistance,
+        0,
+        height,
+      );
+      if (hasExplicitDistance) {
+        this.warnScrollDistanceClamped(
+          'up',
+          scrollDistance,
+          Math.abs(end.y - start.y),
+        );
+      }
+      await this.dragPoint(start, end);
+      return;
+    }
+
+    await this.scroll(0, -scrollDistance, undefined, hasExplicitDistance, 'up');
+  }
+
+  async scrollDown(distance?: number, startPoint?: Point): Promise<void> {
+    const { height } = await this.size();
+    const scrollDistance = Math.round(distance || height);
+    const hasExplicitDistance = distance !== undefined;
+
+    if (startPoint) {
+      const start = {
+        x: Math.round(startPoint.left),
+        y: Math.round(startPoint.top),
+      };
+      const end = this.calculateScrollEndPoint(
+        start,
+        0,
+        -scrollDistance,
+        0,
+        height,
+      );
+      if (hasExplicitDistance) {
+        this.warnScrollDistanceClamped(
+          'down',
+          scrollDistance,
+          Math.abs(end.y - start.y),
+        );
+      }
+      await this.dragPoint(start, end);
+      return;
+    }
+
+    await this.scroll(
+      0,
+      scrollDistance,
+      undefined,
+      hasExplicitDistance,
+      'down',
+    );
+  }
+
+  async scrollLeft(distance?: number, startPoint?: Point): Promise<void> {
+    const { width } = await this.size();
+    const scrollDistance = Math.round(distance || width);
+    const hasExplicitDistance = distance !== undefined;
+
+    if (startPoint) {
+      const start = {
+        x: Math.round(startPoint.left),
+        y: Math.round(startPoint.top),
+      };
+      const end = this.calculateScrollEndPoint(
+        start,
+        scrollDistance,
+        0,
+        width,
+        0,
+      );
+      if (hasExplicitDistance) {
+        this.warnScrollDistanceClamped(
+          'left',
+          scrollDistance,
+          Math.abs(end.x - start.x),
+        );
+      }
+      await this.dragPoint(start, end);
+      return;
+    }
+
+    await this.scroll(
+      -scrollDistance,
+      0,
+      undefined,
+      hasExplicitDistance,
+      'left',
+    );
+  }
+
+  async scrollRight(distance?: number, startPoint?: Point): Promise<void> {
+    const { width } = await this.size();
+    const scrollDistance = Math.round(distance || width);
+    const hasExplicitDistance = distance !== undefined;
+
+    if (startPoint) {
+      const start = {
+        x: Math.round(startPoint.left),
+        y: Math.round(startPoint.top),
+      };
+      const end = this.calculateScrollEndPoint(
+        start,
+        -scrollDistance,
+        0,
+        width,
+        0,
+      );
+      if (hasExplicitDistance) {
+        this.warnScrollDistanceClamped(
+          'right',
+          scrollDistance,
+          Math.abs(end.x - start.x),
+        );
+      }
+      await this.dragPoint(start, end);
+      return;
+    }
+
+    await this.scroll(
+      scrollDistance,
+      0,
+      undefined,
+      hasExplicitDistance,
+      'right',
+    );
+  }
+
+  async ensureYadb() {
+    // Push the YADB tool to the device only once
+    if (!this.yadbPushed) {
+      const adb = await this.getAdb();
+      // Use a more reliable path resolution method
+      const androidPkgJson = createRequire(import.meta.url).resolve(
+        '@midscene/android/package.json',
+      );
+      const yadbBin = path.join(path.dirname(androidPkgJson), 'bin', 'yadb');
+      await adb.push(yadbBin, '/data/local/tmp');
+      this.yadbPushed = true;
+    }
+  }
+
+  /**
+   * Check if text contains characters that may cause issues with ADB inputText.
+   * appium-adb's inputText has known bugs with certain characters:
+   * - Backslash causes broken shell quoting
+   * - Backtick is not escaped at all
+   * - Text containing both " and ' throws an error
+   * - Dollar sign can cause variable expansion issues
+   *
+   * For these characters, we route through yadb which handles them correctly
+   * via escapeForShell + double-quoted shell context.
+   */
+  private shouldUseYadbForText(text: string): boolean {
+    // Check for any non-ASCII characters (code point >= 128)
+    // This covers Latin Unicode characters (ö, é, ñ), Chinese, Japanese, etc.
+    const hasNonAscii = /[\x80-\uFFFF]/.test(text);
+
+    // Check for format specifiers that may cause issues in shell
+    // % can be interpreted as format specifier in some contexts
+    const hasFormatSpecifiers = /%[a-zA-Z]/.test(text);
+
+    // Check for shell-special characters that appium-adb's inputText cannot handle correctly:
+    // \ (backslash) - causes broken quoting in inputText
+    // ` (backtick) - not escaped by inputText, causes command substitution
+    // $ (dollar) - can cause variable expansion issues with double escaping
+    const hasShellSpecialChars = /[\\`$]/.test(text);
+
+    // appium-adb throws if text contains both " and '
+    const hasBothQuotes = text.includes('"') && text.includes("'");
+
+    return (
+      hasNonAscii ||
+      hasFormatSpecifiers ||
+      hasShellSpecialChars ||
+      hasBothQuotes
+    );
+  }
+
+  private async typeText(
+    text: string,
+    options?: AndroidDeviceInputOpt,
+  ): Promise<void> {
+    if (!text) return;
+    const adb = await this.getAdb();
+    const IME_STRATEGY =
+      (this.options?.imeStrategy ||
+        globalConfigManager.getEnvConfigValue(MIDSCENE_ANDROID_IME_STRATEGY)) ??
+      IME_STRATEGY_YADB_FOR_NON_ASCII;
+    const shouldAutoDismissKeyboard =
+      options?.autoDismissKeyboard ?? this.options?.autoDismissKeyboard ?? true;
+
+    // Decide input path for the entire text, not per-segment.
+    const useYadb =
+      IME_STRATEGY === IME_STRATEGY_ALWAYS_YADB ||
+      (IME_STRATEGY === IME_STRATEGY_YADB_FOR_NON_ASCII &&
+        this.shouldUseYadbForText(text));
+
+    if (useYadb) {
+      // yadb handles newlines natively: escapeForShell converts \n (0x0A)
+      // to literal \n (two chars), which yadb interprets back as newline.
+      // Single adb call for the entire text.
+      await this.execYadb(escapeForShell(text));
+    } else {
+      // inputText cannot handle newlines, so split by \n and press Enter between segments.
+      const segments = text.split('\n');
+      for (let i = 0; i < segments.length; i++) {
+        if (segments[i].length > 0) {
+          await adb.inputText(segments[i]);
+        }
+        if (i < segments.length - 1) {
+          await adb.keyevent(66);
+        }
+      }
+    }
+
+    if (shouldAutoDismissKeyboard === true) {
+      await this.hideKeyboard(options);
+    }
+  }
+
+  private normalizeKeyName(key: string): string {
+    // Handle case-insensitive key mapping
+    const keyMap: Record<string, string> = {
+      // Basic keys
+      enter: 'Enter',
+      backspace: 'Backspace',
+      tab: 'Tab',
+      escape: 'Escape',
+      esc: 'Escape', // Common abbreviation
+      home: 'Home',
+      end: 'End',
+      // Arrow keys
+      arrowup: 'ArrowUp',
+      arrowdown: 'ArrowDown',
+      arrowleft: 'ArrowLeft',
+      arrowright: 'ArrowRight',
+      up: 'ArrowUp', // Common shortcuts
+      down: 'ArrowDown',
+      left: 'ArrowLeft',
+      right: 'ArrowRight',
+    };
+
+    const lowerKey = key.toLowerCase();
+    return keyMap[lowerKey] || key; // Return original key if no mapping found
+  }
+
+  private async pressKey(key: string): Promise<void> {
+    // Map web keys to Android key codes (numbers)
+    const keyCodeMap: Record<string, number> = {
+      Enter: 66,
+      Backspace: 67,
+      Tab: 61,
+      ArrowUp: 19,
+      ArrowDown: 20,
+      ArrowLeft: 21,
+      ArrowRight: 22,
+      Escape: 111,
+      Home: 3,
+      End: 123,
+    };
+
+    const adb = await this.getAdb();
+
+    // Normalize key to handle case-insensitive matching
+    const normalizedKey = this.normalizeKeyName(key);
+    const keyCode = keyCodeMap[normalizedKey];
+    if (keyCode !== undefined) {
+      await adb.keyevent(keyCode);
+    } else {
+      // for keys not in the mapping table, try to get its ASCII code (if it's a single character)
+      if (key.length === 1) {
+        const asciiCode = key.toUpperCase().charCodeAt(0);
+        // Android key codes, A-Z is 29-54
+        if (asciiCode >= 65 && asciiCode <= 90) {
+          await adb.keyevent(asciiCode - 36); // 65-36=29 (A's key code)
+        }
+      }
+    }
+  }
+
+  private async tapPoint(point: PointerPoint): Promise<void> {
+    const adb = await this.getAdb();
+
+    // Use adjusted coordinates
+    const { x: adjustedX, y: adjustedY } = await this.adjustCoordinates(
+      point.x,
+      point.y,
+    );
+    await adb.shell(
+      `input${this.getDisplayArg()} swipe ${adjustedX} ${adjustedY} ${adjustedX} ${adjustedY} 150`,
+    );
+  }
+
+  private async doubleTapPoint(point: PointerPoint): Promise<void> {
+    const adb = await this.getAdb();
+    const { x: adjustedX, y: adjustedY } = await this.adjustCoordinates(
+      point.x,
+      point.y,
+    );
+
+    // Use input tap for double-click as it generates proper touch events
+    // that Android can recognize as a double-click gesture
+    const tapCommand = `input${this.getDisplayArg()} tap ${adjustedX} ${adjustedY}`;
+    await adb.shell(tapCommand);
+    // Short delay between taps for double-click recognition
+    await sleep(50);
+    await adb.shell(tapCommand);
+  }
+
+  async mouseMove(): Promise<void> {
+    // ADB doesn't have direct cursor movement functionality
+    // This is a no-op, as ADB doesn't support direct mouse movement
+    return Promise.resolve();
+  }
+
+  private async dragPoint(
+    from: PointerPoint,
+    to: PointerPoint,
+    duration?: number,
+  ): Promise<void> {
+    await this.swipePoint(from, to, duration ?? defaultNormalScrollDuration);
+  }
+
+  private async swipePoint(
+    from: PointerPoint,
+    to: PointerPoint,
+    duration: number,
+  ): Promise<void> {
+    const adb = await this.getAdb();
+    const { x: fromX, y: fromY } = await this.adjustCoordinates(from.x, from.y);
+    const { x: toX, y: toY } = await this.adjustCoordinates(to.x, to.y);
+
+    await adb.shell(
+      `input${this.getDisplayArg()} swipe ${fromX} ${fromY} ${toX} ${toY} ${duration}`,
+    );
+  }
+
+  async scroll(
+    deltaX: number,
+    deltaY: number,
+    duration?: number,
+    warnOnClamp = false,
+    direction?: ScrollDirection,
+  ): Promise<void> {
+    // Input validation
+    if (deltaX === 0 && deltaY === 0) {
+      throw new Error('Scroll distance cannot be zero in both directions');
+    }
+
+    const { width, height } = await this.size();
+
+    // Calculate the starting and ending points of the swipe
+    const n = 4; // Divide the screen into n equal parts
+
+    // Set the starting point based on the swipe direction
+    const startX = Math.round(deltaX < 0 ? (n - 1) * (width / n) : width / n);
+    const startY = Math.round(deltaY < 0 ? (n - 1) * (height / n) : height / n);
+
+    // Calculate the maximum swipeable range so end coordinates stay in bounds.
+    // endX = startX - deltaX, endY = startY - deltaY
+    // Therefore:
+    //  - deltaX > 0 means moving left: max distance is startX
+    //  - deltaX < 0 means moving right: max distance is width - startX
+    //  - deltaY > 0 means moving up: max distance is startY
+    //  - deltaY < 0 means moving down: max distance is height - startY
+    const maxPositiveDeltaX = startX;
+    const maxNegativeDeltaX = width - startX;
+    const maxPositiveDeltaY = startY;
+    const maxNegativeDeltaY = height - startY;
+    const originalDeltaX = deltaX;
+    const originalDeltaY = deltaY;
+
+    // Limit the swipe distance
+    deltaX = Math.max(-maxNegativeDeltaX, Math.min(deltaX, maxPositiveDeltaX));
+    deltaY = Math.max(-maxNegativeDeltaY, Math.min(deltaY, maxPositiveDeltaY));
+
+    if (
+      warnOnClamp &&
+      direction &&
+      (deltaX !== originalDeltaX || deltaY !== originalDeltaY)
+    ) {
+      const requestedDistance =
+        direction === 'left' || direction === 'right'
+          ? Math.abs(originalDeltaX)
+          : Math.abs(originalDeltaY);
+      const appliedDistance =
+        direction === 'left' || direction === 'right'
+          ? Math.abs(deltaX)
+          : Math.abs(deltaY);
+      this.warnScrollDistanceClamped(
+        direction,
+        requestedDistance,
+        appliedDistance,
+      );
+    }
+
+    // Calculate the end coordinates
+    // Note: For swipe, we need to reverse the delta direction
+    // because positive deltaY should scroll up (show top content),
+    // which requires swiping from bottom to top (decreasing Y)
+    const endX = Math.round(startX - deltaX);
+    const endY = Math.round(startY - deltaY);
+
+    const swipeDuration = duration ?? defaultNormalScrollDuration;
+
+    await this.swipePoint(
+      { x: startX, y: startY },
+      { x: endX, y: endY },
+      swipeDuration,
+    );
+  }
+
+  async destroy(): Promise<void> {
+    if (this.destroyed) {
+      return;
+    }
+
+    this.destroyed = true;
+
+    // Clear cached values
+    this.cachedPhysicalDisplayId = undefined;
+    this.cachedScreenSize = null;
+    this.cachedOrientation = null;
+    this.cachedAdjustScale = null;
+
+    // Disconnect scrcpy if active
+    if (this.scrcpyAdapter) {
+      await this.scrcpyAdapter.disconnect();
+      this.scrcpyAdapter = null;
+    }
+
+    try {
+      if (this.adb) {
+        this.adb = null;
+      }
+    } catch (error) {
+      console.error('Error during cleanup:', error);
+    }
+
+    this.connectingAdb = null;
+    this.yadbPushed = false;
+  }
+
+  /**
+   * Get the current device-local time as a formatted string.
+   * This avoids formatting an Android epoch timestamp in the host machine's
+   * timezone, which can disagree with the device status bar.
+   */
+  async getDeviceLocalTimeString(
+    format = 'YYYY-MM-DD HH:mm:ss',
+  ): Promise<string> {
+    const adb = await this.getAdb();
+    try {
+      const stdout = await adb.shell('date +%Y-%m-%dT%H:%M:%S');
+      const match = stdout
+        .trim()
+        .match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})$/);
+
+      if (!match) {
+        throw new Error(`Invalid device time format: ${stdout}`);
+      }
+
+      const [, year, month, day, hours, minutes, seconds] = match;
+      const timeString = format
+        .replace('YYYY', year)
+        .replace('MM', month)
+        .replace('DD', day)
+        .replace('HH', hours)
+        .replace('mm', minutes)
+        .replace('ss', seconds);
+
+      debugDevice(`Got device local time: ${timeString}`);
+      return `${timeString} (${format})`;
+    } catch (error) {
+      debugDevice(`Failed to get device local time: ${error}`);
+      throw new Error(`Failed to get device local time: ${error}`);
+    }
+  }
+
+  async back(): Promise<void> {
+    const adb = await this.getAdb();
+    await adb.shell(`input${this.getDisplayArg()} keyevent 4`);
+  }
+
+  async home(): Promise<void> {
+    const adb = await this.getAdb();
+    await adb.shell(`input${this.getDisplayArg()} keyevent 3`);
+  }
+
+  async recentApps(): Promise<void> {
+    const adb = await this.getAdb();
+    await adb.shell(`input${this.getDisplayArg()} keyevent 187`);
+  }
+
+  private async longPressPoint(
+    point: PointerPoint,
+    duration = 2000,
+  ): Promise<void> {
+    const adb = await this.getAdb();
+
+    // Use adjusted coordinates
+    const { x: adjustedX, y: adjustedY } = await this.adjustCoordinates(
+      point.x,
+      point.y,
+    );
+    await adb.shell(
+      `input${this.getDisplayArg()} swipe ${adjustedX} ${adjustedY} ${adjustedX} ${adjustedY} ${duration}`,
+    );
+  }
+
+  async pullDown(
+    startPoint?: Point,
+    distance?: number,
+    duration = 800,
+  ): Promise<void> {
+    const { width, height } = await this.size();
+
+    // Default start point is near top of screen (but not too close to edge)
+    const start = startPoint
+      ? { x: Math.round(startPoint.left), y: Math.round(startPoint.top) }
+      : { x: Math.round(width / 2), y: Math.round(height * 0.15) };
+
+    // Default distance is larger to ensure refresh is triggered
+    const pullDistance = Math.round(distance || height * 0.5);
+    const end = { x: start.x, y: start.y + pullDistance };
+
+    // Use custom drag with specified duration for better pull-to-refresh detection
+    await this.pullDrag(start, end, duration);
+    await sleep(200); // Give more time for refresh to start
+  }
+
+  async pullDrag(
+    from: { x: number; y: number },
+    to: { x: number; y: number },
+    duration: number,
+  ): Promise<void> {
+    await this.swipePoint(from, to, duration);
+  }
+
+  async pullUp(
+    startPoint?: Point,
+    distance?: number,
+    duration = 600,
+  ): Promise<void> {
+    const { width, height } = await this.size();
+
+    // Default start point is bottom center of screen
+    const start = startPoint
+      ? { x: Math.round(startPoint.left), y: Math.round(startPoint.top) }
+      : { x: Math.round(width / 2), y: Math.round(height * 0.85) };
+
+    // Default distance is 1/3 of screen height
+    const pullDistance = Math.round(distance || height * 0.4);
+    const end = { x: start.x, y: start.y - pullDistance };
+
+    // Use pullDrag for consistent pull gesture handling
+    await this.pullDrag(start, end, duration);
+    await sleep(100);
+  }
+
+  private getDisplayArg(): string {
+    return typeof this.options?.displayId === 'number'
+      ? ` -d ${this.options.displayId}`
+      : '';
+  }
+
+  async getPhysicalDisplayId(): Promise<string | null> {
+    // Return cached value if available
+    if (this.cachedPhysicalDisplayId !== undefined) {
+      return this.cachedPhysicalDisplayId;
+    }
+
+    if (typeof this.options?.displayId !== 'number') {
+      this.cachedPhysicalDisplayId = null;
+      return null;
+    }
+
+    const adb = await this.getAdb();
+    try {
+      const stdout = await adb.shell(
+        `dumpsys SurfaceFlinger --display-id ${this.options.displayId}`,
+      );
+
+      // Parse the output to extract the physical display ID
+      // Look for a pattern like "Display 123456789 (HWC display N):" where N matches our display ID
+      const regex = new RegExp(
+        `Display (\\d+) \\(HWC display ${this.options.displayId}\\):`,
+      );
+      const displayMatch = stdout.match(regex);
+      if (displayMatch?.[1]) {
+        this.cachedPhysicalDisplayId = displayMatch[1];
+        debugDevice(
+          `Found and cached physical display ID: ${displayMatch[1]} for display ID: ${this.options.displayId}`,
+        );
+        return this.cachedPhysicalDisplayId;
+      }
+
+      this.cachedPhysicalDisplayId = null;
+      debugDevice(
+        `Could not find physical display ID for display ID: ${this.options.displayId}`,
+      );
+      return null;
+    } catch (error) {
+      debugDevice(`Error getting physical display ID: ${error}`);
+      this.cachedPhysicalDisplayId = null;
+      return null;
+    }
+  }
+
+  async hideKeyboard(
+    options?: AndroidDeviceInputOpt,
+    timeoutMs = 1000,
+  ): Promise<boolean> {
+    const adb = await this.getAdb();
+    const keyboardDismissStrategy =
+      options?.keyboardDismissStrategy ??
+      this.options?.keyboardDismissStrategy ??
+      'esc-first';
+
+    // Check if keyboard is shown
+    const keyboardStatus = await adb.isSoftKeyboardPresent();
+    const isKeyboardShown =
+      typeof keyboardStatus === 'boolean'
+        ? keyboardStatus
+        : keyboardStatus?.isKeyboardShown;
+
+    if (!isKeyboardShown) {
+      debugDevice('Keyboard has no UI; no closing necessary');
+      return false;
+    }
+
+    // Determine key codes order based on strategy
+    const keyCodes =
+      keyboardDismissStrategy === 'back-first'
+        ? [4, 111] // KEYCODE_BACK, KEYCODE_ESCAPE
+        : [111, 4]; // KEYCODE_ESCAPE, KEYCODE_BACK
+
+    // Try each key code with waiting
+    for (const keyCode of keyCodes) {
+      await adb.keyevent(keyCode);
+
+      // Wait for keyboard to be hidden with timeout
+      const startTime = Date.now();
+      const intervalMs = 100;
+
+      while (Date.now() - startTime < timeoutMs) {
+        await sleep(intervalMs);
+
+        const currentStatus = await adb.isSoftKeyboardPresent();
+        const isStillShown =
+          typeof currentStatus === 'boolean'
+            ? currentStatus
+            : currentStatus?.isKeyboardShown;
+
+        if (!isStillShown) {
+          debugDevice(`Keyboard hidden successfully with keycode ${keyCode}`);
+          return true;
+        }
+      }
+
+      debugDevice(
+        `Keyboard still shown after keycode ${keyCode}, trying next key`,
+      );
+    }
+
+    warnDevice(
+      'Warning: Failed to hide the software keyboard after trying both ESC and BACK keys',
+    );
+    return false;
+  }
+}
+
+/**
+ * Platform-specific action definitions for Android
+ * Single source of truth for both runtime behavior and type definitions
+ */
+const runAdbShellParamSchema = z.object({
+  command: z.string().describe('ADB shell command to execute'),
+});
+
+const launchParamSchema = z.object({
+  uri: z
+    .string()
+    .describe(
+      'App name, package name, or URL to launch. Prioritize using the exact package name or URL the user has provided. If none provided, use the accurate app name.',
+    ),
+});
+
+const terminateParamSchema = z.object({
+  uri: z
+    .string()
+    .describe(
+      'Package name or app name to terminate. Use the exact package name, e.g. com.android.settings.',
+    ),
+});
+
+type RunAdbShellParam = z.infer<typeof runAdbShellParamSchema>;
+type LaunchParam = z.infer<typeof launchParamSchema>;
+type TerminateParam = z.infer<typeof terminateParamSchema>;
+
+export type DeviceActionRunAdbShell = DeviceAction<RunAdbShellParam, string>;
+export type DeviceActionLaunch = DeviceAction<LaunchParam, void>;
+export type DeviceActionTerminate = DeviceAction<TerminateParam, void>;
+
+const createPlatformActions = (
+  device: AndroidDevice,
+): {
+  RunAdbShell: DeviceActionRunAdbShell;
+  Launch: DeviceActionLaunch;
+  Terminate: DeviceActionTerminate;
+} => {
+  return {
+    RunAdbShell: defineAction<
+      typeof runAdbShellParamSchema,
+      RunAdbShellParam,
+      string
+    >({
+      name: 'RunAdbShell',
+      description:
+        'Execute an ADB shell command on the Android device and return the command stdout. Read the returned stdout to decide the next step; the stdout may indicate either success or failure.',
+      interfaceAlias: 'runAdbShell',
+      paramSchema: runAdbShellParamSchema,
+      sample: {
+        command: 'dumpsys window displays | grep -E "mCurrentFocus"',
+      },
+      call: async (param: RunAdbShellParam, context?: ExecutorContext) => {
+        if (!param.command || param.command.trim() === '') {
+          throw new Error('RunAdbShell requires a non-empty command parameter');
+        }
+        const adb = await device.getAdb();
+        const stdout = await runAdbShellStdoutOrThrow(adb, param.command);
+        const planningFeedback = buildRunAdbShellPlanningFeedback({
+          command: param.command,
+          stdout,
+        });
+        if (planningFeedback && context?.task) {
+          context.task.planningFeedback = planningFeedback;
+        }
+        return stdout;
+      },
+    }),
+    Launch: defineAction<typeof launchParamSchema, LaunchParam, void>({
+      name: 'Launch',
+      description: 'Launch an Android app or URL',
+      interfaceAlias: 'launch',
+      paramSchema: launchParamSchema,
+      sample: {
+        uri: 'com.example.app',
+      },
+      call: async (param) => {
+        if (!param.uri || param.uri.trim() === '') {
+          throw new Error('Launch requires a non-empty uri parameter');
+        }
+        await device.launch(param.uri);
+      },
+    }),
+    Terminate: defineAction<typeof terminateParamSchema, TerminateParam, void>({
+      name: 'Terminate',
+      description: 'Terminate (force-stop) an Android app by package name',
+      interfaceAlias: 'terminate',
+      paramSchema: terminateParamSchema,
+      call: async (param) => {
+        if (!param.uri || param.uri.trim() === '') {
+          throw new Error('Terminate requires a non-empty uri parameter');
+        }
+        await device.terminate(param.uri);
+      },
+    }),
+  } as const;
+};
+
+export type DeviceActionAndroidBackButton = DeviceAction<undefined, void>;
+export type DeviceActionAndroidHomeButton = DeviceAction<undefined, void>;
+export type DeviceActionAndroidRecentAppsButton = DeviceAction<undefined, void>;

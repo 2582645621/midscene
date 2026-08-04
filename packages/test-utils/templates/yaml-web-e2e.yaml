@@ -1,0 +1,45 @@
+# Template: Web E2E Test (YAML)
+#
+# Copy this file to your e2e test directory and customize.
+# Run with: npx midscene ./path/to/this-file.yaml
+#
+# Environment variables can be used with ${VAR_NAME} syntax.
+# See: packages/core/src/yaml/player.ts for all supported flow items.
+
+target:
+  url: "https://example.com"
+  # serve: ./dist          # Uncomment for local file serving
+  # viewportWidth: 1920
+  # viewportHeight: 1080
+  # waitForNetworkIdle:
+  #   timeout: 5000
+  #   continueOnNetworkIdleError: true
+
+# agent:
+#   aiActContext: "This is a web application for ..."
+
+tasks:
+  - name: page loads successfully
+    flow:
+      - sleep: 2000
+      - aiAssert: The page is fully loaded and displays main content
+
+  - name: user interaction flow
+    flow:
+      - aiInput: "test input value"
+        locate: the input field description
+      - aiTap: the submit button
+      - sleep: 1000
+      - aiAssert: The expected result is displayed after submission
+
+  # - name: query data from page
+  #   flow:
+  #     - aiQuery: "string, the page title text"
+  #       name: page_title
+  #     - aiAssert: The page title contains expected text
+
+  # - name: wait for async content
+  #   flow:
+  #     - aiWaitFor: "Loading spinner is gone and content is visible"
+  #       timeout: 10000
+  #     - aiAssert: The async content is now displayed

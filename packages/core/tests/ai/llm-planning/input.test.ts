@@ -1,0 +1,68 @@
+import { ConversationHistory, plan } from '@/ai-model';
+import { getModelRuntime } from '@/ai-model/models';
+import type { DeviceAction } from '@/types';
+import { globalModelConfigManager } from '@midscene/shared/env';
+import { describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
+import { getContextFromFixture } from '../../evaluation';
+vi.setConfig({
+  testTimeout: 180 * 1000,
+  hookTimeout: 30 * 1000,
+});
+
+const mockActionSpace: DeviceAction[] = [
+  {
+    name: 'Input',
+    description: 'Replace the input field with a new value',
+    paramSchema: z.object({
+      value: z.string(),
+    }),
+    call: () => {},
+  },
+];
+
+const defaultModelConfig = globalModelConfigManager.getModelConfig('default');
+const defaultModelRuntime = getModelRuntime(defaultModelConfig);
+
+describe('automation - planning input', () => {
+  it('input value', async () => {
+    const { context } = await getContextFromFixture('todo');
+    const instructions = [
+      'In the task input box, type learning english',
+      'In the task input box, type learning english and hit Enter key',
+    ];
+
+    for (const instruction of instructions) {
+      const { actions } = await plan(instruction, {
+        context,
+        actionSpace: mockActionSpace,
+        modelRuntime: defaultModelRuntime,
+        conversationHistory: new ConversationHistory(),
+        includeLocateInPlanning: true,
+      });
+      expect(actions).toBeDefined();
+      expect(actions?.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('input value Add, delete, correct and check', async () => {
+    const { context } = await getContextFromFixture('todo-input-with-value');
+    const instructions = [
+      'Append " tomorrow" to the existing content in the task input box',
+      // 'Replace the word "English" with "Skiing" in the existing content of the task input box. Remember to keep other unmatched content',
+      // 'Delete the word "English" from the existing content in the task input box (first line) . Remember to keep the remaining content',
+    ];
+
+    for (const instruction of instructions) {
+      const { actions } = await plan(instruction, {
+        context,
+        actionSpace: mockActionSpace,
+        modelRuntime: defaultModelRuntime,
+        conversationHistory: new ConversationHistory(),
+        includeLocateInPlanning: true,
+      });
+      expect(actions).toBeDefined();
+      expect(actions?.length).toBeGreaterThan(0);
+    }
+  });
+});

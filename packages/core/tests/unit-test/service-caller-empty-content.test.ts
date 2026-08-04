@@ -1,0 +1,83 @@
+import type { IModelConfig } from '@midscene/shared/env';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const mockCreate = vi.fn();
+
+vi.mock('openai', () => ({
+  default: vi.fn().mockImplementation(() => ({
+    chat: {
+      completions: {
+        create: mockCreate,
+      },
+    },
+  })),
+}));
+
+describe('service-caller empty content handling', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it(
+    'should preserve usage when model returns empty content',
+    { timeout: 30000 },
+    async () => {
+      const { callAI, AIResponseParseError } = await import(
+        '@/ai-model/service-caller'
+      );
+      const { getModelRuntime } = await import('@/ai-model/models');
+
+      mockCreate.mockResolvedValue({
+        choices: [{ message: { content: '' } }],
+        usage: {
+          prompt_tokens: 12,
+          completion_tokens: 0,
+          total_tokens: 12,
+          prompt_tokens_details: {
+            cached_tokens: 7,
+          },
+        },
+        model: 'gpt-4o-2024-08-06',
+        _request_id: 'req_test_123',
+      });
+
+      const modelConfig: IModelConfig = {
+        modelName: 'gpt-4o',
+        openaiApiKey: 'test-key',
+        openaiBaseURL: 'https://api.openai.com/v1',
+        modelDescription: 'test model',
+        intent: 'default',
+        slot: 'default',
+      };
+
+      const promise = callAI(
+        [{ role: 'user', content: 'hello' }],
+        getModelRuntime(modelConfig),
+      );
+
+      await expect(promise).rejects.toBeInstanceOf(AIResponseParseError);
+
+      try {
+        await promise;
+      } catch (error) {
+        const typedError = error as InstanceType<typeof AIResponseParseError>;
+        expect(typedError.usage).toMatchObject({
+          prompt_tokens: 12,
+          completion_tokens: 0,
+          total_tokens: 12,
+          cached_input: 7,
+          prompt_tokens_details: {
+            cached_tokens: 7,
+          },
+          model_name: 'gpt-4o',
+          model_description: 'test model',
+          response_model_name: 'gpt-4o-2024-08-06',
+          slot: 'default',
+          request_id: 'req_test_123',
+        });
+        expect(typedError.usage?.intent).toBeUndefined();
+        expect(typedError.rawResponse).toContain('"choices"');
+      }
+    },
+  );
+});

@@ -1,0 +1,601 @@
+import { systemPromptToLocateElement } from '@/ai-model';
+import { getModelAdapter } from '@/ai-model/models';
+import {
+  descriptionForAction,
+  systemPromptToTaskPlanning,
+} from '@/ai-model/prompt/llm-planning';
+import { systemPromptToLocateSection } from '@/ai-model/prompt/llm-section-locator';
+import { getUiTarsPlanningPrompt } from '@/ai-model/prompt/ui-tars-planning';
+import type { LocateResultPromptSpec } from '@/ai-model/shared/model-locate-result';
+import { defineActionInput, defineActionSwipe } from '@/device';
+import { getMidsceneLocationSchema } from '@/index';
+import type { TModelFamily } from '@midscene/shared/env';
+import { describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
+import {
+  extractDataQueryPrompt,
+  systemPromptToExtract,
+} from '../../../src/ai-model/prompt/extraction';
+import { mockActionSpace } from '../../common';
+import { mockNonChinaTimeZone, restoreIntl } from '../mocks/intl-mock';
+
+// Mock getPreferredLanguage to ensure consistent test output
+vi.mock('@midscene/shared/env', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@midscene/shared/env')>();
+  return {
+    ...actual,
+    getPreferredLanguage: vi.fn().mockReturnValue('English'),
+  };
+});
+
+const mockLocatorScheme =
+  '{"bbox": [number, number, number, number], "prompt": string}';
+const locatePromptSpecFor = (
+  modelFamily: TModelFamily,
+): LocateResultPromptSpec => {
+  const locateAdapter = getModelAdapter(modelFamily).locate;
+  if (locateAdapter.kind !== 'standard') {
+    throw new Error(`${modelFamily} should use standard locate adapter`);
+  }
+  return locateAdapter.resultAdapter.promptSpec;
+};
+
+describe('action space', () => {
+  it('action without param, no locate needed', () => {
+    const action = descriptionForAction(
+      {
+        name: 'Tap',
+        description: 'Tap the element',
+        call: async () => {},
+      },
+      mockLocatorScheme,
+    );
+    expect(action).toMatchInlineSnapshot(`
+      "- Tap, Tap the element
+        - type: "Tap""
+    `);
+  });
+
+  it('action with param, no locate needed', () => {
+    const action = descriptionForAction(
+      {
+        name: 'Tap',
+        description: 'Tap the element',
+        paramSchema: z.object({
+          foo: z.string().describe('The foo to be tapped'),
+          bar: z.number().optional().describe('An optional bar value'),
+          help: z.string().describe('Help information for this action'),
+        }),
+        call: async () => {},
+      },
+      mockLocatorScheme,
+    );
+    expect(action).toMatchInlineSnapshot(`
+      "- Tap, Tap the element
+        - type: "Tap"
+        - param:
+          - foo: string // The foo to be tapped
+          - bar?: number // An optional bar value
+          - help: string // Help information for this action"
+    `);
+  });
+
+  it('action with param, multiple location fields', () => {
+    const action = descriptionForAction(
+      {
+        name: 'Tap',
+        description: 'Tap the element',
+        paramSchema: z.object({
+          value: z.string().describe('The value to be tapped'),
+          value2: z.number().describe('The value to be tapped').optional(),
+          value3: z.number().describe('The value 3').optional().default(345),
+          locate: getMidsceneLocationSchema().describe(
+            'The element to be tapped',
+          ),
+          locate2: getMidsceneLocationSchema()
+            .describe('The element to be tapped for the second time')
+            .optional(),
+          scrollType: z
+            .enum([
+              'once',
+              'untilBottom',
+              'untilTop',
+              'untilRight',
+              'untilLeft',
+            ])
+            .default('once')
+            .describe('The scroll type'),
+          actionType: z
+            .enum(['Tap', 'DragAndDrop', 'Scroll', 'Input', 'Assert'])
+            .describe('The scroll type')
+            .default('Tap')
+            .optional(),
+          option: z.number().optional().describe('An optional option value'),
+        }),
+        call: async () => {},
+      },
+      mockLocatorScheme,
+    );
+    expect(action).toMatchInlineSnapshot(`
+      "- Tap, Tap the element
+        - type: "Tap"
+        - param:
+          - value: string // The value to be tapped
+          - value2?: number // The value to be tapped
+          - value3?: number // The value 3, default: 345
+          - locate: {"bbox": [number, number, number, number], "prompt": string} // The element to be tapped
+          - locate2?: {"bbox": [number, number, number, number], "prompt": string} // The element to be tapped for the second time
+          - scrollType?: enum('once', 'untilBottom', 'untilTop', 'untilRight', 'untilLeft') // The scroll type, default: "once"
+          - actionType?: enum('Tap', 'DragAndDrop', 'Scroll', 'Input', 'Assert') // The scroll type, default: "Tap"
+          - option?: number // An optional option value"
+    `);
+  });
+
+  it('action with object param schema (Launch-like)', () => {
+    const action = descriptionForAction(
+      {
+        name: 'Launch',
+        description: 'Launch an app or URL',
+        paramSchema: z.object({
+          uri: z.string().describe('The URI to launch'),
+        }),
+        call: async () => {},
+      },
+      mockLocatorScheme,
+    );
+    expect(action).toMatchInlineSnapshot(`
+      "- Launch, Launch an app or URL
+        - type: "Launch"
+        - param:
+          - uri: string // The URI to launch"
+    `);
+  });
+
+  it('action with object param schema (RunAdbShell-like)', () => {
+    const action = descriptionForAction(
+      {
+        name: 'RunAdbShell',
+        description: 'Execute ADB shell command',
+        paramSchema: z.object({
+          command: z.string().describe('ADB shell command to execute'),
+        }),
+        call: async () => {},
+      },
+      mockLocatorScheme,
+    );
+    expect(action).toMatchInlineSnapshot(`
+      "- RunAdbShell, Execute ADB shell command
+        - type: "RunAdbShell"
+        - param:
+          - command: string // ADB shell command to execute"
+    `);
+  });
+
+  it('input action explains typeOnly incremental edits', () => {
+    const action = descriptionForAction(
+      defineActionInput({
+        clearInput: async () => {},
+        keyboardPress: async () => {},
+        typeText: async () => {},
+      }),
+      mockLocatorScheme,
+    );
+
+    expect(action).toContain('only the inserted characters for typeOnly mode');
+    expect(action).toContain(
+      'should be set explicitly for incremental edits after moving the cursor',
+    );
+  });
+
+  it('swipe action explains touch slider use', () => {
+    const action = descriptionForAction(
+      defineActionSwipe({
+        swipe: async () => {},
+        size: async () => ({ width: 1080, height: 2400 }),
+      }),
+      mockLocatorScheme,
+    );
+
+    expect(action).toContain('adjust a continuous control such as a slider');
+    expect(action).toContain(
+      'Use "distance" + "direction" for relative movement, or "start" + "end" for precise endpoint movement.',
+    );
+  });
+
+  it('planning prompt recommends cursor-level recovery for text inserts', async () => {
+    const prompt = await systemPromptToTaskPlanning({
+      actionSpace: mockActionSpace,
+      includeLocateInPlanning: false,
+    });
+
+    expect(prompt).toContain(
+      'use CursorMove when the caret must be adjusted precisely',
+    );
+    expect(prompt).toContain(
+      'do not switch to replace as a fallback for cursor placement failures',
+    );
+  });
+
+  it('planning prompt recommends swipe for touch sliders', async () => {
+    const prompt = await systemPromptToTaskPlanning({
+      actionSpace: mockActionSpace,
+      includeLocateInPlanning: false,
+    });
+
+    expect(prompt).not.toContain(
+      "If the user's task can be completed with the RunAdbShell action, prefer using the RunAdbShell action",
+    );
+    expect(prompt).toContain(
+      'such as a slider, prefer Swipe from the current handle or filled position to the requested track endpoint instead of tapping the endpoint',
+    );
+  });
+
+  it('planning prompt recommends RunAdbShell only when action is available', async () => {
+    const runAdbShellAction = {
+      name: 'RunAdbShell',
+      description: 'Execute ADB shell command',
+      paramSchema: z.object({
+        command: z.string().describe('The ADB shell command to execute'),
+      }),
+      call: async () => '',
+    };
+
+    const prompt = await systemPromptToTaskPlanning({
+      actionSpace: [...mockActionSpace, runAdbShellAction],
+      includeLocateInPlanning: false,
+    });
+
+    expect(prompt).toContain(
+      "If the user's task can be completed with the RunAdbShell action, prefer using the RunAdbShell action",
+    );
+  });
+});
+
+describe('system prompts', () => {
+  it('planning - cot', async () => {
+    const prompt = await systemPromptToTaskPlanning({
+      actionSpace: mockActionSpace,
+      includeLocateInPlanning: false,
+    });
+    expect(prompt).toMatchSnapshot();
+  });
+
+  it('planning - includeLocateInPlanning requires modelFamily', async () => {
+    await expect(
+      systemPromptToTaskPlanning({
+        actionSpace: mockActionSpace,
+        includeLocateInPlanning: true,
+      }),
+    ).rejects.toThrow(/MIDSCENE_MODEL_FAMILY/);
+  });
+
+  it('planning - qwen - cot', async () => {
+    const prompt = await systemPromptToTaskPlanning({
+      actionSpace: mockActionSpace,
+      locatePromptSpec: locatePromptSpecFor('qwen2.5-vl'),
+      includeLocateInPlanning: true,
+    });
+    expect(prompt).toMatchSnapshot();
+  });
+
+  it('planning - qwen - cot without bbox', async () => {
+    const prompt = await systemPromptToTaskPlanning({
+      actionSpace: mockActionSpace,
+      includeLocateInPlanning: false,
+    });
+
+    expect(prompt).toMatchSnapshot();
+  });
+
+  it('planning - gemini', async () => {
+    const prompt = await systemPromptToTaskPlanning({
+      actionSpace: mockActionSpace,
+      locatePromptSpec: locatePromptSpecFor('gemini'),
+      includeLocateInPlanning: true,
+    });
+    expect(prompt).toMatchSnapshot();
+  });
+
+  it('planning - android', async () => {
+    const prompt = await systemPromptToTaskPlanning({
+      actionSpace: mockActionSpace,
+      locatePromptSpec: locatePromptSpecFor('qwen2.5-vl'),
+      includeLocateInPlanning: true,
+    });
+    expect(prompt).toMatchSnapshot();
+  });
+
+  it('planning - includeSubGoals true', async () => {
+    const prompt = await systemPromptToTaskPlanning({
+      actionSpace: mockActionSpace,
+      includeLocateInPlanning: false,
+      includeSubGoals: true,
+    });
+    expect(prompt).toMatchSnapshot();
+  });
+
+  it('planning - includeSubGoals false (default) should not contain sub-goal tags', async () => {
+    const prompt = await systemPromptToTaskPlanning({
+      actionSpace: mockActionSpace,
+      includeLocateInPlanning: false,
+      includeSubGoals: false,
+    });
+
+    // Should not contain sub-goal related tags and content
+    expect(prompt).not.toContain('<update-plan-content>');
+    expect(prompt).not.toContain('<mark-sub-goal-done>');
+    expect(prompt).not.toContain('<sub-goal');
+
+    // Should still contain thought tag
+    expect(prompt).toContain('<thought>');
+
+    // Observation Guidelines are only available in deepThink (sub-goals) mode
+    expect(prompt).not.toContain('### Observation Guidelines');
+
+    // Should have simplified Step 1 title
+    expect(prompt).toContain('## Step 1: Observe (related tags: <thought>)');
+    expect(prompt).not.toContain(
+      '## Step 1: Observe and Plan (related tags: <thought>, <update-plan-content>, <mark-sub-goal-done>)',
+    );
+  });
+
+  it('planning - includeSubGoals true should contain sub-goal tags', async () => {
+    const prompt = await systemPromptToTaskPlanning({
+      actionSpace: mockActionSpace,
+      includeLocateInPlanning: false,
+      includeSubGoals: true,
+    });
+
+    // Should contain sub-goal related tags and content
+    expect(prompt).toContain('<update-plan-content>');
+    expect(prompt).toContain('<mark-sub-goal-done>');
+    expect(prompt).toContain('<sub-goal');
+
+    // Should still contain thought tag
+    expect(prompt).toContain('<thought>');
+
+    // Observation Guidelines are only available in deepThink (sub-goals) mode
+    expect(prompt).toContain('### Observation Guidelines');
+
+    // Should have full Step 1 title with sub-goal tags
+    expect(prompt).toContain(
+      '## Step 1: Observe and Plan (related tags: <thought>, <update-plan-content>, <mark-sub-goal-done>)',
+    );
+  });
+
+  it('planning - includeSubGoals true should include sub-goal examples', async () => {
+    const prompt = await systemPromptToTaskPlanning({
+      actionSpace: mockActionSpace,
+      includeLocateInPlanning: false,
+      includeSubGoals: true,
+    });
+
+    // Should contain sub-goal example content
+    expect(prompt).toContain('Log in to the system');
+    expect(prompt).toContain('Complete all to-do items');
+    expect(prompt).toContain('Submit the registration form');
+    expect(prompt).toContain('status="finished|pending"');
+  });
+
+  it('planning - includeSubGoals false should not include sub-goal examples', async () => {
+    const prompt = await systemPromptToTaskPlanning({
+      actionSpace: mockActionSpace,
+      includeLocateInPlanning: false,
+      includeSubGoals: false,
+    });
+
+    // Should not contain sub-goal example content
+    expect(prompt).not.toContain('Log in to the system');
+    expect(prompt).not.toContain('Complete all to-do items');
+    expect(prompt).not.toContain('Submit the registration form');
+  });
+
+  it('planning should include priority override guidance for input verification', async () => {
+    const prompt = await systemPromptToTaskPlanning({
+      actionSpace: mockActionSpace,
+      includeLocateInPlanning: false,
+      includeSubGoals: false,
+    });
+
+    expect(prompt).toContain(
+      'CRITICAL PRIORITY OVERRIDE - Input verification after an input action:',
+    );
+    expect(prompt).toContain(
+      'This rule overrides the general requirement to verify the exact target text from the screenshot.',
+    );
+    expect(prompt).toContain(
+      'If the previous step already executed an input action, and the current input field is not empty, you MUST directly treat that input as successful.',
+    );
+    expect(prompt).toContain(
+      'The general rule "do EXACTLY what the user asked" still applies to the intended input value you execute, but it MUST NOT be enforced by re-validating the visible text in the screenshot after the input action.',
+    );
+  });
+
+  it('planning should include dropdown scrolling guidance', async () => {
+    const prompt = await systemPromptToTaskPlanning({
+      actionSpace: mockActionSpace,
+      includeLocateInPlanning: false,
+      includeSubGoals: false,
+    });
+
+    expect(prompt).toContain('Scrollable option lists and dropdowns');
+    expect(prompt).toContain(
+      'When choosing an item from a scrollable select, dropdown, listbox, menu, or similar option list',
+    );
+    expect(prompt).toContain(
+      'Once the list is open, interact with the list itself, not the page',
+    );
+    expect(prompt).toContain(
+      'If the list is open but the target option is not visible, try to find it by scrolling the open list/dropdown',
+    );
+    expect(prompt).toContain(
+      'prefer small incremental Scroll actions with an explicit distance',
+    );
+    expect(prompt).toContain(
+      'treat the current selection step as fulfilled and continue evaluating the remaining user instruction',
+    );
+  });
+
+  it('planning should include durable change completion guidance', async () => {
+    const prompt = await systemPromptToTaskPlanning({
+      actionSpace: mockActionSpace,
+      includeLocateInPlanning: false,
+      includeSubGoals: false,
+    });
+
+    expect(prompt).toContain('Change completion');
+    expect(prompt).toContain('If the requested outcome is a durable change');
+    expect(prompt).toContain(
+      "Continue through the app/page's normal completion control such as Save, Done, Confirm, OK, Submit, Apply, Send, or Publish before completing",
+    );
+    expect(prompt).toContain(
+      'If the user only asks for an intermediate UI state',
+    );
+  });
+
+  it('planning - multi-turn example with includeSubGoals true should have sub-goal tags', async () => {
+    const prompt = await systemPromptToTaskPlanning({
+      actionSpace: mockActionSpace,
+      includeLocateInPlanning: false,
+      includeSubGoals: true,
+    });
+
+    // Multi-turn example should contain sub-goal related content
+    expect(prompt).toContain('## Multi-turn Conversation Example');
+    expect(prompt).toContain(
+      '<sub-goal index="1" status="pending">Fill in the Name field',
+    );
+    expect(prompt).toContain('<mark-sub-goal-done>');
+    expect(prompt).toContain("<memory>Name field has been filled with 'John'");
+    // Should show returning specific value in complete
+    expect(prompt).toContain('then return the filled email address');
+    expect(prompt).toContain(
+      '<complete success="true">john@example.com</complete>',
+    );
+  });
+
+  it('planning - multi-turn example with includeSubGoals false should not have sub-goal tags', async () => {
+    const prompt = await systemPromptToTaskPlanning({
+      actionSpace: mockActionSpace,
+      includeLocateInPlanning: false,
+      includeSubGoals: false,
+    });
+
+    // Multi-turn example should exist but without sub-goal tags
+    expect(prompt).toContain('## Multi-turn Conversation Example');
+    expect(prompt).not.toContain('Fill in the Name field');
+    expect(prompt).not.toContain(
+      "<memory>Name field has been filled with 'John'",
+    );
+    // Should still show returning specific value in complete
+    expect(prompt).toContain('then return the filled email address');
+    expect(prompt).toContain(
+      '<complete success="true">john@example.com</complete>',
+    );
+  });
+
+  it('planning - multi-turn example with includeLocateInPlanning true should have bbox in locate', async () => {
+    const prompt = await systemPromptToTaskPlanning({
+      actionSpace: mockActionSpace,
+      locatePromptSpec: locatePromptSpecFor('qwen3-vl'),
+      includeLocateInPlanning: true,
+      includeSubGoals: false,
+    });
+
+    // Multi-turn example should contain bbox in locate examples
+    expect(prompt).toContain('## Multi-turn Conversation Example');
+    expect(prompt).toContain('"bbox": [120, 180, 380, 210]'); // Name field bbox
+    expect(prompt).toContain('"bbox": [120, 240, 380, 270]'); // Email field bbox
+  });
+
+  it('planning - multi-turn example with includeLocateInPlanning false should not have bbox in locate', async () => {
+    const prompt = await systemPromptToTaskPlanning({
+      actionSpace: mockActionSpace,
+      includeLocateInPlanning: false,
+      includeSubGoals: false,
+    });
+
+    // Multi-turn example should not contain bbox
+    expect(prompt).toContain('## Multi-turn Conversation Example');
+    expect(prompt).not.toContain('"bbox": [120, 180, 380, 210]');
+    expect(prompt).not.toContain('"bbox": [120, 240, 380, 270]');
+  });
+
+  it('section locator - gemini', () => {
+    const prompt = systemPromptToLocateSection(locatePromptSpecFor('gemini'));
+    expect(prompt).toMatchSnapshot();
+  });
+
+  it('section locator - qwen', () => {
+    const prompt = systemPromptToLocateSection(
+      locatePromptSpecFor('qwen2.5-vl'),
+    );
+    expect(prompt).toMatchSnapshot();
+  });
+
+  it('locator - qwen', () => {
+    const prompt = systemPromptToLocateElement(
+      locatePromptSpecFor('qwen2.5-vl'),
+    );
+    expect(prompt).toMatchSnapshot();
+  });
+
+  it('locator - gemini', () => {
+    const prompt = systemPromptToLocateElement(locatePromptSpecFor('gemini'));
+    expect(prompt).toMatchSnapshot();
+  });
+
+  it('ui-tars planning', () => {
+    // Mock Intl to ensure non-China timezone
+    mockNonChinaTimeZone();
+
+    const prompt = getUiTarsPlanningPrompt();
+    expect(prompt).toMatchSnapshot();
+
+    // Restore original Intl
+    restoreIntl();
+  });
+});
+
+describe('extract element', () => {
+  it('systemPromptToExtract', () => {
+    const prompt = systemPromptToExtract();
+    expect(prompt).toMatchSnapshot();
+  });
+
+  it('systemPromptToExtract without screenshot', () => {
+    const prompt = systemPromptToExtract({ screenshotIncluded: false });
+    expect(prompt).toMatchSnapshot();
+  });
+
+  it('systemPromptToExtract with screenshot and reference images', () => {
+    const prompt = systemPromptToExtract({
+      screenshotIncluded: true,
+      referenceImagesIncluded: true,
+    });
+    expect(prompt).toMatchSnapshot();
+  });
+
+  it('systemPromptToExtract with reference images and without screenshot', () => {
+    const prompt = systemPromptToExtract({
+      screenshotIncluded: false,
+      referenceImagesIncluded: true,
+    });
+    expect(prompt).toMatchSnapshot();
+  });
+
+  it('extract element by extractDataPrompt', () => {
+    const prompt = extractDataQueryPrompt(
+      'todo title, string',
+      'todo title, string',
+    );
+    expect(prompt).toMatchSnapshot();
+  });
+
+  it('extract element by extractDataPrompt - object', () => {
+    const prompt = extractDataQueryPrompt('todo title, string', {
+      foo: 'an array indicates the foo',
+    });
+    expect(prompt).toMatchSnapshot();
+  });
+});
