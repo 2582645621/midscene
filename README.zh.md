@@ -143,3 +143,16 @@ Midscene.js 采用 [MIT 许可证](https://github.com/web-infra-dev/midscene/blo
 <div align="center">
   如果这个项目对你有帮助或启发，欢迎点个 Star
 </div>
+
+## 📝 App知识图谱
+工作台-Workbench-page_workbench_view(埋点)：
+	设备列表-Anycubic(顶部向下的箭头按钮)-page_device_list_view(埋点)：已添加设备、+添加设备
+	摄像头：连接、取消
+	+：手动添加打印
+	设置(齿轮)-Settings-page_device_setting_view(埋点)：
+	打印机信息(>)：设备昵称、CN、
+	喷嘴-Nozzle-adjust_nozzle_temp(埋点)
+	固件更新- Firmware update(>) -page_firmware_update_view (埋点)
+	⋮-解绑设备-Unbind Device -click_confirm_delete_device (埋点)
+	控制-Control-page_control_center_view (埋点)：
+
