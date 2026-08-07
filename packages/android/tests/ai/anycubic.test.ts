@@ -39,6 +39,8 @@ describe('Anycubic app', () => {
       // 点击“控制”，随后用 Android 返回键回到首页
       await agent.aiTap('控制');
       await sleep(2000);
+      await agent.aiTap('喷嘴');
+      
       await agent.runAdbShell('input keyevent KEYCODE_BACK');
       await sleep(2000);
 

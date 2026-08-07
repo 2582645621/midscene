@@ -17,7 +17,7 @@
   },
   "dependencies": {
     "@midscene/android": "workspace:*",
-    "@midscene/android-playground": "workspace:*",
+    "android-playground": "workspace:*",
     "@midscene/computer": "workspace:*",
     "@midscene/computer-playground": "workspace:*",
     "@midscene/core": "workspace:*",

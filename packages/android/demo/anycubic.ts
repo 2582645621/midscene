@@ -16,10 +16,16 @@ const ANYCUBIC_LAUNCHER = 'ac.cloud.com/.StartActivity';
 Promise.resolve(
   (async () => {
     const devices = await getConnectedDevices();
-    const device = new AndroidDevice(devices[0].udid);
+    const device = new AndroidDevice(devices[0].udid, {
+      imeStrategy: 'always-yadb',
+    });
     const agent = new AndroidAgent(device, {
       aiActionContext:
         'If any location, permission, user agreement, etc. popup, click agree. If login page pops up, close it.',
+      cache: {
+        id: 'my-android-test-cache', // 缓存ID，用于区分不同场景的缓存
+        strategy: 'read-write', // 读写模式（默认）
+      },
     });
     await device.connect();
     // 唤醒并保持屏幕常亮，避免息屏导致截图全黑、AI 误判为黑屏

@@ -1,3 +1,5 @@
-# @midscene/android-playground
+# Midscene Android Playground
 
-See <https://midscenejs.com/android-getting-started.html#try-playground-no-code>.
+Playground tool for Android cli @midscene/android.
+
+See https://midscenejs.com/ for details.

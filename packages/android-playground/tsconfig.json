@@ -1,21 +1,13 @@
 {
-  "extends": "../shared/tsconfig.base.json",
+  "extends": "../../packages/shared/tsconfig.app.base.json",
   "compilerOptions": {
-    "rootDir": ".",
-    "module": "ES2020",
-    "declarationDir": "dist/types",
-    "types": ["node"]
+    "noUnusedLocals": true,
+    "noUnusedParameters": true
   },
-  "include": ["src", "tests"],
+  "include": ["src"],
   "references": [
     {
-      "path": "../android"
-    },
-    {
-      "path": "../shared"
-    },
-    {
-      "path": "../playground"
+      "path": "../../packages/playground-app"
     }
   ]
 }
